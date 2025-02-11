@@ -206,9 +206,36 @@ type RequestVoteReply struct {
 }
 
 // example RequestVote RPC handler.
+// 要票请求接收方逻辑
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (PartA, PartB).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	// 对齐term
+	if args.Term < rf.currentTerm {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject votes, higher term, T%d > T%d", args.CandidateId, rf.currentTerm, args.Term)
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.becomeFollowerLocked(args.Term)
+	}
+
+	// 检查选票
+	if rf.votedFor != -1 {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject votes, already voted for S%d", args.CandidateId, rf.votedFor)
+		return
+	}
+
+	rf.votedFor = args.CandidateId
+	reply.VoteGranted = true
+	// 重要！别忘了
+	rf.resetElectionTimeoutLocked()
+	LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Vote granted")
 }
 
 // example code to send a RequestVote RPC to a server.
