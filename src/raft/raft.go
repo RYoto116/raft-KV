@@ -36,6 +36,24 @@ const (
 	Leader    Role = "Leader"
 )
 
+const (
+	electionTimeoutMin time.Duration = 250 * time.Millisecond
+	electionTimeoutMax time.Duration = 400 * time.Millisecond
+)
+
+// 重置选举时钟
+func (rf *Raft) resetElectionTimeoutLocked() {
+	rf.electionStart = time.Now()
+	// 随机超时时间
+	randRange := int64(electionTimeoutMax - electionTimeoutMin)
+	rf.electionDuration = electionTimeoutMin + time.Duration(rand.Int63()%randRange)
+}
+
+// 选举超时检查
+func (rf *Raft) isElectionTimeoutLocked() bool {
+	return time.Since(rf.electionStart) > rf.electionDuration
+}
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -74,7 +92,7 @@ type Raft struct {
 
 	// 选举周期控制
 	electionStart    time.Time
-	electionDuration time.Duration // 随机
+	electionDuration time.Duration // 随机，避免“活锁”
 }
 
 func (rf *Raft) becomeFollowerLocked(term int) {
@@ -175,17 +193,22 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (PartA, PartB).
+	Term        int
+	CandidateId int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (PartA).
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (PartA, PartB).
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -261,11 +284,100 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
+func (rf *Raft) electionTicker() {
 	for rf.killed() == false {
 
 		// Your code here (PartA)
 		// Check if a leader election should be started.
+		rf.mu.Lock()
+		// 非Leader节点选举超时，需要转换为Candidate
+		if rf.role != Leader && rf.isElectionTimeoutLocked() {
+			rf.becomeCandidateLocked()
+			go rf.startElection(rf.currentTerm)
+		}
+
+		rf.mu.Unlock()
+
+		// pause for a random amount of time between 50 and 350
+		// milliseconds.
+		ms := 50 + (rand.Int63() % 300)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+}
+
+// Candidate要票：向其他peer发送RPC请求选票
+func (rf *Raft) startElection(term int) {
+	votes := 0
+	// 重要：RPC请求需要在临界区之外
+	askVoteFromPeer := func(args *RequestVoteArgs, peer int) {
+		reply := &RequestVoteReply{}
+		ok := rf.sendRequestVote(peer, args, reply)
+
+		// 处理请求响应
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if !ok {
+			LOG(rf.me, rf.currentTerm, DDebug, "Ask vote from S%d, lost or error", peer)
+			return
+		}
+
+		// 对齐Candidate当前term和选票响应term
+		if reply.Term > rf.currentTerm {
+			rf.becomeFollowerLocked(reply.Term)
+			return
+		}
+
+		// 检查上下文
+		if rf.isContextLostLocked(Candidate, term) {
+			LOG(rf.me, rf.currentTerm, DVote, "Lost context, abort RequestVoteReply for S%d", peer)
+			return
+		}
+
+		// 统计选票
+		if reply.VoteGranted {
+			votes++
+			if votes > len(rf.peers)/2 {
+				// 票数超过一半，变为Leader，发起心跳和日志同步
+				rf.becomeLeaderLocked()
+				go rf.replicationTicker(term)
+			}
+		}
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.isContextLostLocked(Candidate, term) {
+		LOG(rf.me, rf.currentTerm, DVote, "Lost Candidate to %s, abort RequestVote", rf.role)
+		return
+	}
+
+	for peer := 0; peer < len(rf.peers); peer++ {
+		if peer == rf.me {
+			votes++
+		} else {
+			args := &RequestVoteArgs{
+				Term:        rf.currentTerm,
+				CandidateId: rf.me,
+			}
+			go askVoteFromPeer(args, peer)
+		}
+	}
+}
+
+// 检测节点发送RPC后的角色是否变化
+func (rf *Raft) isContextLostLocked(role Role, term int) bool {
+	return role != rf.role || term != rf.currentTerm
+}
+
+func (rf *Raft) replicationTicker(term int) {
+	for rf.killed() == false {
+
+		// Your code here (PartA)
+		// Check if a leader election should be started.
+		rf.mu.Lock()
+
+		rf.mu.Unlock()
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
