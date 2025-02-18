@@ -2,9 +2,21 @@ package raft
 
 import "time"
 
+type LogEntry struct {
+	CommandValid bool        // 是否应该应用日志
+	Command      interface{} // 操作日志，任意结构体
+	Term         int         // 日志所在任期
+}
+
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
+
+	// 匹配点试探参数，term和index唯一确定一条日志
+	PrevLogIndex int
+	PrevLogTerm  int
+	// 待追加日志条目
+	Entries []LogEntry
 }
 
 type AppendEntriesReply struct {
@@ -17,9 +29,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+// 接收方的回调函数
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
 
 	// 对齐term
 	if args.Term < rf.currentTerm {
@@ -28,11 +44,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.Term >= rf.currentTerm {
-		rf.becomeFollowerLocked(args.Term)
+		rf.becomeFollowerLocked(args.Term) // 将其他peers都变为Follower
 	}
 
+	// 若PrevLogIndex不匹配，返回失败
+	if args.PrevLogIndex >= len(rf.log) {
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower's log too short, Len: %d < PrevLog: %d", args.LeaderId, len(rf.log), args.PrevLogIndex)
+		return
+	}
+
+	// 匹配：本地日志中给定index的term是否等于给定term
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower's log not match, [%d]: T%d != T%d", args.LeaderId, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+		return
+	}
+
+	// 匹配成功，将参数中的Entries添加到本地
+	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	reply.Success = true
+	LOG(rf.me, rf.currentTerm, DLog2, "Follower accept logs: (%d, %d]", args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
+
+	// TODO: 实现LeaderCommit的应用功能
+
 	rf.resetElectionTimeoutLocked()
-	LOG(rf.me, rf.currentTerm, DLog, "<- S%d, Log entries appended", args.LeaderId)
 }
 
 // 心跳循环、日志同步，生命周期是一个term

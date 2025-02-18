@@ -79,6 +79,12 @@ type Raft struct {
 	currentTerm int
 	votedFor    int // -1 表示未投票
 
+	log []LogEntry // 每个状态机的本地日志
+
+	// 仅供Leader使用，所有peer的视图
+	nextIndex  []int // 试探点视图
+	matchIndex []int // 匹配点视图
+
 	// 选举周期控制
 	electionStart    time.Time
 	electionDuration time.Duration // 随机，避免“活锁”
@@ -272,6 +278,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
+
+	rf.log = append(rf.log, LogEntry{}) // dummy节点避免边界溢出
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
