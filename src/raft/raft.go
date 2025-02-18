@@ -119,6 +119,8 @@ func (rf *Raft) becomeCandidateLocked() {
 	}
 
 	LOG(rf.me, rf.currentTerm, DVote, "%s->Candidate, For T%d", rf.role, rf.currentTerm+1)
+	// 重要！！
+	rf.resetElectionTimeoutLocked()
 	rf.currentTerm++
 	rf.role = Candidate
 	rf.votedFor = rf.me
@@ -137,11 +139,9 @@ func (rf *Raft) becomeLeaderLocked() {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (PartA).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.role == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -238,7 +238,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// 检查选票
-	if rf.votedFor != -1 {
+	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject votes, already voted for S%d", args.CandidateId, rf.votedFor)
 		return
 	}
@@ -247,7 +247,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = true
 	// 重要！别忘了
 	rf.resetElectionTimeoutLocked()
-	LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Vote granted")
+	LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Vote granted", rf.votedFor)
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -265,7 +265,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.resetElectionTimeoutLocked()
-	LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Log entries appended")
+	LOG(rf.me, rf.currentTerm, DLog, "<- S%d, Log entries appended", args.LeaderId)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -441,7 +441,7 @@ func (rf *Raft) replicationTicker(term int) {
 func (rf *Raft) startReplication(term int) bool {
 	replicateToPeer := func(args *AppendEntriesArgs, peer int) {
 		reply := &AppendEntriesReply{}
-		ok := rf.sendAppendEntries(rf.me, args, reply)
+		ok := rf.sendAppendEntries(peer, args, reply) // BUG1: peer 参数带入成了 rf.me
 
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
@@ -511,7 +511,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.electionTicker()
 
 	return rf
 }
