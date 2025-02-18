@@ -99,6 +99,26 @@ func (rf *Raft) startReplication(term int) bool {
 			rf.becomeFollowerLocked(reply.Term)
 			return
 		}
+
+		// 处理RPC响应
+		// 若匹配失败，探测更小的nextIndex
+		if !reply.Success {
+			// TODO
+			idx := args.PrevLogIndex
+			term := args.PrevLogTerm
+			for idx > 0 && rf.log[idx].Term == term {
+				idx--
+			}
+
+			rf.nextIndex[peer] = idx + 1
+			LOG(rf.me, rf.currentTerm, DLog, "Not match with S%d in %d, try next=%d", peer, args.PrevLogIndex, rf.nextIndex[peer])
+			return
+		}
+
+		// 匹配成功，更新match/next index
+		rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+
 	}
 
 	rf.mu.Lock()
@@ -111,13 +131,22 @@ func (rf *Raft) startReplication(term int) bool {
 
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
+			// 重要！！
+			rf.matchIndex[rf.me] = len(rf.log) - 1 // Leader自己当前的匹配下标
+			rf.nextIndex[rf.me] = len(rf.log)
 			continue
 		}
 
+		prevIdx := rf.nextIndex[peer] - 1
+		prevTerm := rf.log[prevIdx].Term
+
 		// 发起RPC
 		args := &AppendEntriesArgs{
-			Term:     rf.currentTerm,
-			LeaderId: rf.me,
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevIdx,
+			PrevLogTerm:  prevTerm,
+			Entries:      rf.log[prevIdx+1:],
 		}
 		go replicateToPeer(args, peer)
 	}
