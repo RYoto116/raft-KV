@@ -1,6 +1,9 @@
 package raft
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 type LogEntry struct {
 	CommandValid bool        // 是否应该应用日志
@@ -17,6 +20,9 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  int
 	// 待追加日志条目
 	Entries []LogEntry
+
+	// 更新peer的commitIndex
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -64,7 +70,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	LOG(rf.me, rf.currentTerm, DLog2, "Follower accept logs: (%d, %d]", args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
 
-	// TODO: 实现LeaderCommit的应用功能
+	// 实现LeaderCommit的应用功能
+	if args.LeaderCommit > rf.commitIndex {
+		LOG(rf.me, rf.currentTerm, DApply, "Follower update the commit index: %d->%d", rf.commitIndex, args.LeaderCommit)
+		rf.commitIndex = args.LeaderCommit
+		rf.applyCond.Signal()
+	}
 
 	rf.resetElectionTimeoutLocked()
 }
@@ -119,7 +130,13 @@ func (rf *Raft) startReplication(term int) bool {
 		rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 
-		// TODO: 更新commitIndex
+		// 更新commitIndex：所有peer匹配点的众数（超过半数的数-排序中位数）
+		majorityMatched := rf.getMajorityIndexLocked()
+		if majorityMatched > rf.commitIndex {
+			LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index: %d->%d", rf.commitIndex, majorityMatched)
+			rf.commitIndex = majorityMatched
+			rf.applyCond.Signal() // Signal后释放mu
+		}
 	}
 
 	rf.mu.Lock()
@@ -148,9 +165,18 @@ func (rf *Raft) startReplication(term int) bool {
 			PrevLogIndex: prevIdx,
 			PrevLogTerm:  prevTerm,
 			Entries:      rf.log[prevIdx+1:],
+			LeaderCommit: rf.commitIndex,
 		}
 		go replicateToPeer(args, peer)
 	}
 
 	return true
+}
+
+func (rf *Raft) getMajorityIndexLocked() int {
+	tmpIndices := make([]int, len(rf.matchIndex))
+	copy(tmpIndices, rf.matchIndex)
+	sort.Ints(tmpIndices)
+	LOG(rf.me, rf.currentTerm, DDebug, "Majority index after sort: %v[%d]=%d", tmpIndices, len(tmpIndices)/2, tmpIndices[len(tmpIndices)/2])
+	return tmpIndices[len(tmpIndices)/2]
 }

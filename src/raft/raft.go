@@ -85,6 +85,12 @@ type Raft struct {
 	nextIndex  []int // 试探点视图
 	matchIndex []int // 匹配点视图
 
+	// 用于日志应用
+	commitIndex int // 本地最后一个提交日志编号
+	lastApplied int // 最后应用的日志编号
+	applyCh     chan ApplyMsg
+	applyCond   *sync.Cond
+
 	// 选举周期控制
 	electionStart    time.Time
 	electionDuration time.Duration // 随机，避免“活锁”
@@ -271,6 +277,8 @@ func (rf *Raft) isContextLostLocked(role Role, term int) bool {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
+
+// 构造raft的peer同时传进来一个channel
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -288,11 +296,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
+	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.electionTicker()
+
+	go rf.applicationTicker()
 
 	return rf
 }
