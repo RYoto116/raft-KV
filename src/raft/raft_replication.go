@@ -119,6 +119,7 @@ func (rf *Raft) startReplication(term int) bool {
 		rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 
+		// TODO: 更新commitIndex
 	}
 
 	rf.mu.Lock()

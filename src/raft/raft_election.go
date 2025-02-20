@@ -43,6 +43,9 @@ type RequestVoteArgs struct {
 	// Your data here (PartA, PartB).
 	Term        int
 	CandidateId int
+
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
@@ -51,6 +54,23 @@ type RequestVoteReply struct {
 	// Your data here (PartA).
 	Term        int
 	VoteGranted bool
+}
+
+// Raft 算法是强 Leader 算法，因此会要求 Leader 一定要包含所有已经提交日志。
+// 进行选举时，需要确保只有具有比大多数 Peer 更新日志的候选人才能当选 Leader。
+
+// 比较Candidate与Follower的最后一个日志条目新旧
+func (rf *Raft) isMoreUpToDateLocked(candidateIndex, candidateTerm int) bool {
+	lastIndex, lastTerm := len(rf.log)-1, rf.log[len(rf.log)-1].Term
+	LOG(rf.me, rf.currentTerm, DVote, "Compare last log, Me: [%d]T%d, Candidate: [%d]T%d", lastIndex, lastTerm, candidateIndex, candidateTerm)
+
+	// Term 大者新
+	if candidateTerm != lastTerm {
+		return lastTerm > candidateTerm
+	}
+
+	// Term一样，index大者新
+	return lastIndex > candidateIndex
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -81,6 +101,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 检查选票
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject votes, already voted for S%d", args.CandidateId, rf.votedFor)
+		return
+	}
+
+	// 检查候选者日志是否更新
+	if rf.isMoreUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject votes, Candidate less up-to-date", args.CandidateId)
 		return
 	}
 
@@ -143,8 +169,10 @@ func (rf *Raft) startElection(term int) {
 			votes++
 		} else {
 			args := &RequestVoteArgs{
-				Term:        rf.currentTerm,
-				CandidateId: rf.me,
+				Term:         rf.currentTerm,
+				CandidateId:  rf.me,
+				LastLogIndex: len(rf.log) - 1,
+				LastLogTerm:  rf.log[len(rf.log)-1].Term,
 			}
 			go askVoteFromPeer(args, peer)
 		}
