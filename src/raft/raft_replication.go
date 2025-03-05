@@ -74,7 +74,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		LOG(rf.me, rf.currentTerm, DApply, "Follower update the commit index: %d->%d", rf.commitIndex, args.LeaderCommit)
 		rf.commitIndex = args.LeaderCommit
-		rf.applyCond.Signal()
+		rf.applyCond.Signal() // Signal唤醒阻塞在Wait()上的goroutine
 	}
 
 	rf.resetElectionTimeoutLocked()
@@ -92,7 +92,7 @@ func (rf *Raft) replicationTicker(term int) {
 	}
 }
 
-// 返回Leader是否成功发起一轮心跳（上下文不变）
+// 返回Leader是否成功发起一轮心跳，只在给定 term 内有效
 func (rf *Raft) startReplication(term int) bool {
 	replicateToPeer := func(args *AppendEntriesArgs, peer int) {
 		reply := &AppendEntriesReply{}
@@ -101,13 +101,20 @@ func (rf *Raft) startReplication(term int) bool {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 		if !ok {
-			LOG(rf.me, rf.currentTerm, DDebug, "Append entries to S%d, lost or error", peer)
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, lost or error", peer)
 			return
 		}
 
-		// 对齐term
+		// 对齐term，让出领导权
 		if reply.Term > rf.currentTerm {
 			rf.becomeFollowerLocked(reply.Term)
+			return
+		}
+
+		// 重要！！
+		// 检查上下文，检查自己仍然是给定 term 的 Leader
+		if rf.isContextLostLocked(Leader, term) {
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Context lost, T%d:%s->T%d:%s", peer, term, Leader, rf.currentTerm, rf.role)
 			return
 		}
 
@@ -122,7 +129,7 @@ func (rf *Raft) startReplication(term int) bool {
 			}
 
 			rf.nextIndex[peer] = idx + 1
-			LOG(rf.me, rf.currentTerm, DLog, "Not match with S%d in %d, try next=%d", peer, args.PrevLogIndex, rf.nextIndex[peer])
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at %d, try next=%d", peer, args.PrevLogIndex, rf.nextIndex[peer])
 			return
 		}
 
@@ -142,6 +149,7 @@ func (rf *Raft) startReplication(term int) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// 重要！！
 	if rf.isContextLostLocked(Leader, term) {
 		LOG(rf.me, rf.currentTerm, DLog, "Lost Leader[T%d] to %s[T%d]", term, rf.role, rf.currentTerm)
 		return false
