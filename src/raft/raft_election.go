@@ -111,7 +111,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.votedFor = args.CandidateId
+	rf.persistLocked()
+
 	reply.VoteGranted = true
+
 	// 重要！别忘了
 	rf.resetElectionTimeoutLocked()
 	LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Vote granted", rf.votedFor)
@@ -139,6 +142,7 @@ func (rf *Raft) startElection(term int) {
 			return
 		}
 
+		// 重要！！
 		// 检查上下文
 		if rf.isContextLostLocked(Candidate, term) {
 			LOG(rf.me, rf.currentTerm, DVote, "Lost context, abort RequestVoteReply for S%d", peer)

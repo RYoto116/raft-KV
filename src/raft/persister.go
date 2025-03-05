@@ -36,6 +36,7 @@ func (ps *Persister) Copy() *Persister {
 	return np
 }
 
+// 反序列化，从磁盘上读出一个字节数组
 func (ps *Persister) ReadRaftState() []byte {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -50,6 +51,7 @@ func (ps *Persister) RaftStateSize() int {
 
 // Save both Raft state and K/V snapshot as a single atomic action,
 // to help avoid them getting out of sync.
+// 序列化接口，负责将字节数组形式的快照（PartD 才用）和 raft 状态写入磁盘。
 func (ps *Persister) Save(raftstate []byte, snapshot []byte) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()

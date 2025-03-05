@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+const (
+	invalidTerm  int = 0
+	invalidIndex int = 0
+)
+
 type LogEntry struct {
 	CommandValid bool        // 是否应该应用日志
 	Command      interface{} // 操作日志，任意结构体
@@ -28,6 +33,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -43,6 +51,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
+	// 重要！！
+	// 收到AppendEntries RPC时，无论Follower接受还是拒绝日志，只要认可对方是Leader就要重置选举时钟
+	// 否则，如果Leader和Follower匹配日志所花时间特别长，Follower一直不重置选举时钟，就有可能错误地触发超时选举，变为新任期的Candidate
+	defer rf.resetElectionTimeoutLocked()
+
 	// 对齐term
 	if args.Term < rf.currentTerm {
 		LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Reject log, higher term, T%d > T%d", args.LeaderId, rf.currentTerm, args.Term)
@@ -53,20 +66,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.becomeFollowerLocked(args.Term) // 将其他peers都变为Follower
 	}
 
-	// 若PrevLogIndex不匹配，返回失败
+	// 若Follower日志过短，则匹配失败，将ConflictIndex设为Follower的日志长度
 	if args.PrevLogIndex >= len(rf.log) {
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = invalidTerm
+
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower's log too short, Len: %d < PrevLog: %d", args.LeaderId, len(rf.log), args.PrevLogIndex)
 		return
 	}
 
-	// 匹配：本地日志中给定index的term是否等于给定term
+	// Follower日志在PrevLogIndex处的term不等于给定term，则匹配失败，更新ConflictIndex和ConflictTerm
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// ConflictTerm设置为Follower日志在PrevLogIndex处的term
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+
+		// ConflictIndex设置为ConflictTerm的第一条日志
+		reply.ConflictIndex = rf.firstLogForLocked(reply.ConflictTerm)
+
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower's log not match, [%d]: T%d != T%d", args.LeaderId, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
 		return
 	}
 
 	// 匹配成功，将参数中的Entries添加到本地
 	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	rf.persistLocked()
 	reply.Success = true
 	LOG(rf.me, rf.currentTerm, DLog2, "Follower accept logs: (%d, %d]", args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
 
@@ -76,8 +99,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = args.LeaderCommit
 		rf.applyCond.Signal() // Signal唤醒阻塞在Wait()上的goroutine
 	}
-
-	rf.resetElectionTimeoutLocked()
 }
 
 // 心跳循环、日志同步，生命周期是一个term
@@ -118,17 +139,30 @@ func (rf *Raft) startReplication(term int) bool {
 			return
 		}
 
-		// 处理RPC响应
-		// 若匹配失败，探测更小的nextIndex
+		// 处理RPC响应参数
+
+		// 若匹配失败，探测更小的nextIndex：回滚。
+		// 【难点】每回滚一次需要来回两次RPC。而replicationInterval是固定的，RPC次数过多，同步该peer日志的间隔过大，导致tester中日志同步超时
 		if !reply.Success {
-			// TODO
-			idx := args.PrevLogIndex
-			term := args.PrevLogTerm
-			for idx > 0 && rf.log[idx].Term == term {
-				idx--
+			prevNext := rf.nextIndex[peer]
+			// ConflictTerm为空，说明Follower日志太短，
+			if reply.ConflictTerm == invalidTerm {
+				rf.nextIndex[peer] = reply.ConflictIndex
+			} else {
+				firstTermIndex := rf.firstLogForLocked(reply.ConflictTerm)
+				if firstTermIndex != invalidIndex {
+					rf.nextIndex[peer] = firstTermIndex
+				} else {
+					// Leader日志中不存在ConflictTerm期间的日志
+					rf.nextIndex[peer] = reply.ConflictIndex
+				}
 			}
 
-			rf.nextIndex[peer] = idx + 1
+			// 避免多次回退时，较早的回退RPC较晚到达Leader，使得nextIndex[peer]反而增大
+			if rf.nextIndex[peer] > prevNext {
+				rf.nextIndex[peer] = prevNext
+			}
+
 			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at %d, try next=%d", peer, args.PrevLogIndex, rf.nextIndex[peer])
 			return
 		}
@@ -139,6 +173,7 @@ func (rf *Raft) startReplication(term int) bool {
 
 		// 更新commitIndex：所有peer匹配点的众数（超过半数的数-排序中位数）
 		majorityMatched := rf.getMajorityIndexLocked()
+
 		if majorityMatched > rf.commitIndex {
 			LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index: %d->%d", rf.commitIndex, majorityMatched)
 			rf.commitIndex = majorityMatched
