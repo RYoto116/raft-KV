@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"sort"
 	"time"
 )
@@ -30,12 +31,20 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
+func (args *AppendEntriesArgs) String() string {
+	return fmt.Sprintf("Leader-%d, T%d, prev=[%d]T%d, logs=(%d, %d], CommitIdx=%d", args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.PrevLogIndex, args.PrevLogIndex+len(args.Entries), args.LeaderCommit)
+}
+
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
 
 	ConflictIndex int
 	ConflictTerm  int
+}
+
+func (reply *AppendEntriesReply) String() string {
+	return fmt.Sprintf("T%d, Success=%v, ConflictTerm=[%d]T%d", reply.Term, reply.Success, reply.ConflictIndex, reply.ConflictTerm)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -47,6 +56,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, entries appended, args=%v", args.LeaderId, args.String())
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
@@ -54,7 +64,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 重要！！
 	// 收到AppendEntries RPC时，无论Follower接受还是拒绝日志，只要认可对方是Leader就要重置选举时钟
 	// 否则，如果Leader和Follower匹配日志所花时间特别长，Follower一直不重置选举时钟，就有可能错误地触发超时选举，变为新任期的Candidate
-	defer rf.resetElectionTimeoutLocked()
+	defer func() {
+		rf.resetElectionTimeoutLocked()
+		if !reply.Success {
+			LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Follower conflict: [%d]T%d", args.LeaderId, reply.ConflictIndex, reply.ConflictTerm)
+			LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Follower log=%v", args.LeaderId, rf.logString())
+		}
+	}()
 
 	// 对齐term
 	if args.Term < rf.currentTerm {
@@ -126,6 +142,8 @@ func (rf *Raft) startReplication(term int) bool {
 			return
 		}
 
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, AppendEntries, reply=%v", peer, reply.String())
+
 		// 对齐term，让出领导权
 		if reply.Term > rf.currentTerm {
 			rf.becomeFollowerLocked(reply.Term)
@@ -163,7 +181,8 @@ func (rf *Raft) startReplication(term int) bool {
 				rf.nextIndex[peer] = prevNext
 			}
 
-			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at %d, try next=%d", peer, args.PrevLogIndex, rf.nextIndex[peer])
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at Prev=[%d]T%d, try next Prev=[%d]T%d", peer, args.PrevLogIndex, args.PrevLogTerm, rf.nextIndex[peer]-1, rf.log[rf.nextIndex[peer]-1].Term)
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Leader log=%v", peer, rf.logString())
 			return
 		}
 
@@ -174,7 +193,8 @@ func (rf *Raft) startReplication(term int) bool {
 		// 更新commitIndex：所有peer匹配点的众数（超过半数的数-排序中位数）
 		majorityMatched := rf.getMajorityIndexLocked()
 
-		if majorityMatched > rf.commitIndex {
+		// Figure 8: Leader不能提交非当前任期的日志
+		if majorityMatched > rf.commitIndex && rf.log[majorityMatched].Term == rf.currentTerm {
 			LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index: %d->%d", rf.commitIndex, majorityMatched)
 			rf.commitIndex = majorityMatched
 			rf.applyCond.Signal() // Signal后释放mu
@@ -210,6 +230,8 @@ func (rf *Raft) startReplication(term int) bool {
 			Entries:      rf.log[prevIdx+1:],
 			LeaderCommit: rf.commitIndex,
 		}
+
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, append entries, args=%v", peer, args.String())
 		go replicateToPeer(args, peer)
 	}
 
@@ -222,4 +244,21 @@ func (rf *Raft) getMajorityIndexLocked() int {
 	sort.Ints(tmpIndices)
 	LOG(rf.me, rf.currentTerm, DDebug, "Majority index after sort: %v[%d]=%d", tmpIndices, len(tmpIndices)/2, tmpIndices[len(tmpIndices)/2])
 	return tmpIndices[len(tmpIndices)/2]
+}
+
+func (rf *Raft) logString() string {
+	var terms string
+	prevIdx := 0
+	prevTerm := 0
+	for idx, entry := range rf.log {
+		if entry.Term != prevTerm {
+			terms += fmt.Sprintf("[%d, %d]T%d ", prevIdx, idx-1, prevTerm)
+			prevTerm = entry.Term
+			prevIdx = idx
+		}
+		if idx == len(rf.log)-1 {
+			terms += fmt.Sprintf("[%d, %d]T%d", prevIdx, idx, prevTerm)
+		}
+	}
+	return terms
 }

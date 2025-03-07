@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"math/rand"
 	"time"
 )
@@ -48,12 +49,20 @@ type RequestVoteArgs struct {
 	LastLogTerm  int
 }
 
+func (args *RequestVoteArgs) String() string {
+	return fmt.Sprintf("Candidate-%d, T%d, last=[%d]T%d", args.CandidateId, args.Term, args.LastLogIndex, args.LastLogTerm)
+}
+
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (PartA).
 	Term        int
 	VoteGranted bool
+}
+
+func (reply *RequestVoteReply) String() string {
+	return fmt.Sprintf("T%d, VoteGranted=%v", reply.Term, reply.VoteGranted)
 }
 
 // Raft 算法是强 Leader 算法，因此会要求 Leader 一定要包含所有已经提交日志。
@@ -84,13 +93,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (PartA, PartB).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Vote Asked, args=%v", args.CandidateId, args.String())
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
 	// 对齐term
 	if args.Term < rf.currentTerm {
-		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject votes, higher term, T%d > T%d", args.CandidateId, rf.currentTerm, args.Term)
+		LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Reject votes, higher term, T%d > T%d", args.CandidateId, rf.currentTerm, args.Term)
 		return
 	}
 
@@ -100,13 +110,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// 检查选票
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
-		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject votes, already voted for S%d", args.CandidateId, rf.votedFor)
+		LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Reject votes, already voted for S%d", args.CandidateId, rf.votedFor)
 		return
 	}
 
 	// 检查候选者日志是否更全更新
 	if rf.isMoreUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
-		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject votes, Candidate less up-to-date", args.CandidateId)
+		LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Reject votes, Candidate less up-to-date", args.CandidateId)
 		return
 	}
 
@@ -117,7 +127,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// 重要！别忘了
 	rf.resetElectionTimeoutLocked()
-	LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Vote granted", rf.votedFor)
+	LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Vote granted", args.CandidateId)
 }
 
 // Candidate要票：向其他peer发送RPC请求选票
@@ -135,6 +145,8 @@ func (rf *Raft) startElection(term int) {
 			LOG(rf.me, rf.currentTerm, DDebug, "Ask vote from S%d, lost or error", peer)
 			return
 		}
+
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Askvote reply=%v", peer, reply.String())
 
 		// 对齐Candidate当前term和选票响应term
 		if reply.Term > rf.currentTerm {
@@ -178,6 +190,7 @@ func (rf *Raft) startElection(term int) {
 				LastLogIndex: len(rf.log) - 1,
 				LastLogTerm:  rf.log[len(rf.log)-1].Term,
 			}
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Ask vote, args=%d", peer, args.String())
 			go askVoteFromPeer(args, peer)
 		}
 	}

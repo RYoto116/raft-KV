@@ -159,6 +159,7 @@ func (rf *Raft) GetState() (int, bool) {
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
+// 需要将应用层传下来的 snapshot 存储下来
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (PartD).
 
