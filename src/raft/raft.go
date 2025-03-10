@@ -80,7 +80,8 @@ type Raft struct {
 	currentTerm int
 	votedFor    int // -1 表示未投票
 
-	log []LogEntry // 每个状态机的本地日志
+	// log []LogEntry // 每个状态机的本地日志
+	log *RaftLog
 
 	// 仅供Leader使用，所有peer的视图
 	nextIndex  []int // 试探点视图
@@ -142,7 +143,7 @@ func (rf *Raft) becomeLeaderLocked() {
 	LOG(rf.me, rf.currentTerm, DLeader, "Become Leader in T%d", rf.currentTerm)
 	rf.role = Leader
 	for peer := 0; peer < len(rf.peers); peer++ {
-		rf.nextIndex[peer] = len(rf.log)
+		rf.nextIndex[peer] = rf.log.size()
 		rf.matchIndex[peer] = 0
 	}
 }
@@ -159,10 +160,15 @@ func (rf *Raft) GetState() (int, bool) {
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
-// 需要将应用层传下来的 snapshot 存储下来
+
+// 服务器不再需要参数中包含的snapshot，Raft需要截断这些日志并存储下来
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (PartD).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	rf.log.doSnapshot(index, snapshot)
+	rf.persistLocked()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -188,15 +194,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return 0, 0, false
 	}
 
-	rf.log = append(rf.log, LogEntry{
+	rf.log.append(LogEntry{
 		CommandValid: true,
 		Command:      command,
 		Term:         rf.currentTerm,
 	})
 	rf.persistLocked()
-	LOG(rf.me, rf.currentTerm, DLeader, "Leader accept log [%d]T%d", len(rf.log)-1, rf.currentTerm)
+	LOG(rf.me, rf.currentTerm, DLeader, "Leader accept log [%d]T%d", rf.log.size()-1, rf.currentTerm)
 
-	return len(rf.log) - 1, rf.currentTerm, true
+	return rf.log.size() - 1, rf.currentTerm, true
+	// 第一个返回值是该command提交后应在的下标位置，第二个返回值是当前任期，第三个返回值是当前服务器是否是Server
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -223,17 +230,6 @@ func (rf *Raft) isContextLostLocked(role Role, term int) bool {
 	return role != rf.role || term != rf.currentTerm
 }
 
-func (rf *Raft) firstLogForLocked(term int) int {
-	for idx, entry := range rf.log {
-		if entry.Term == term {
-			return idx
-		} else if entry.Term > term {
-			break
-		}
-	}
-	return invalidIndex
-}
-
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -257,7 +253,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 1 // 由于InvalidTerm为了0，初始化term从1开始
 	rf.votedFor = -1
 
-	rf.log = append(rf.log, LogEntry{Term: invalidTerm}) // dummy节点避免边界溢出，初始化logIndex从1开始
+	rf.log = NewLog(invalidIndex, invalidTerm, nil, nil)
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -266,6 +262,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCond = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
+	// 若宕机重启，需要对部分字段反序列化
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections

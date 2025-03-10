@@ -19,14 +19,15 @@ func (rf *Raft) persistLocked() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
+	rf.log.persist(e)
+
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, nil)
 	LOG(rf.me, rf.currentTerm, DPersist, "Persist: %v", rf.persistString())
 }
 
 func (rf *Raft) persistString() string {
-	return fmt.Sprintf("T%d, VotedFor: %d, Log: [0, %d)", rf.currentTerm, rf.votedFor, len(rf.log))
+	return fmt.Sprintf("T%d, VotedFor: %d, Log: [0, %d)", rf.currentTerm, rf.votedFor, rf.log.size())
 }
 
 // restore previously persisted state.
@@ -40,25 +41,23 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
-	var log []LogEntry
 
 	if err := d.Decode(&currentTerm); err != nil {
-		LOG(rf.me, rf.currentTerm, DPersist, "Read currentTerm error: %v", currentTerm)
+		LOG(rf.me, rf.currentTerm, DPersist, "Read currentTerm error: %v", err)
 		return
 	}
 	rf.currentTerm = currentTerm
 
 	if err := d.Decode(&votedFor); err != nil {
-		LOG(rf.me, rf.currentTerm, DPersist, "Read votedFor error: %v", votedFor)
+		LOG(rf.me, rf.currentTerm, DPersist, "Read votedFor error: %v", err)
 		return
 	}
 	rf.votedFor = votedFor
 
-	if err := d.Decode(&log); err != nil {
-		LOG(rf.me, rf.currentTerm, DPersist, "Read log error: %v", log)
+	if err := rf.log.readPersist(d); err != nil {
+		LOG(rf.me, rf.currentTerm, DPersist, "Read log error: %v", err)
 		return
 	}
-	rf.log = log
 
 	LOG(rf.me, rf.currentTerm, DPersist, "Read from persist: %v", rf.persistString())
 }

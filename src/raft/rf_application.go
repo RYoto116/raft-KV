@@ -8,7 +8,9 @@ func (rf *Raft) applicationTicker() {
 		// 临界区中不能有任何阻塞操作
 		// 1. 收集上一次应用之后的所有日志条目
 		entries := make([]LogEntry, 0)
-		entries = append(entries, rf.log[rf.lastApplied+1:rf.commitIndex+1]...)
+		for idx := rf.lastApplied + 1; idx <= rf.commitIndex; idx++ {
+			entries = append(entries, rf.log.at(idx))
+		}
 		rf.mu.Unlock()
 
 		// 逐一构造ApplyMsg进行apply

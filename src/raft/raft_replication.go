@@ -68,7 +68,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.resetElectionTimeoutLocked()
 		if !reply.Success {
 			LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Follower conflict: [%d]T%d", args.LeaderId, reply.ConflictIndex, reply.ConflictTerm)
-			LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Follower log=%v", args.LeaderId, rf.logString())
+			LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Follower log=%v", args.LeaderId, rf.log.String())
 		}
 	}()
 
@@ -83,28 +83,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// 若Follower日志过短，则匹配失败，将ConflictIndex设为Follower的日志长度
-	if args.PrevLogIndex >= len(rf.log) {
-		reply.ConflictIndex = len(rf.log)
+	if args.PrevLogIndex >= rf.log.size() {
+		reply.ConflictIndex = rf.log.size()
 		reply.ConflictTerm = invalidTerm
 
-		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower's log too short, Len: %d < PrevLog: %d", args.LeaderId, len(rf.log), args.PrevLogIndex)
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower's log too short, Len: %d < PrevLog: %d", args.LeaderId, rf.log.size(), args.PrevLogIndex)
 		return
 	}
 
 	// Follower日志在PrevLogIndex处的term不等于给定term，则匹配失败，更新ConflictIndex和ConflictTerm
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.log.at(args.PrevLogIndex).Term != args.PrevLogTerm {
 		// ConflictTerm设置为Follower日志在PrevLogIndex处的term
-		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictTerm = rf.log.at(args.PrevLogIndex).Term
 
 		// ConflictIndex设置为ConflictTerm的第一条日志
-		reply.ConflictIndex = rf.firstLogForLocked(reply.ConflictTerm)
+		reply.ConflictIndex = rf.log.firstForLocked(reply.ConflictTerm)
 
-		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower's log not match, [%d]: T%d != T%d", args.LeaderId, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower's log not match, [%d]: T%d != T%d", args.LeaderId, args.PrevLogIndex, rf.log.at(args.PrevLogIndex).Term, args.PrevLogTerm)
 		return
 	}
 
 	// 匹配成功，将参数中的Entries添加到本地
-	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	rf.log.appendFrom(args.PrevLogIndex, args.Entries)
 	rf.persistLocked()
 	reply.Success = true
 	LOG(rf.me, rf.currentTerm, DLog2, "Follower accept logs: (%d, %d]", args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
@@ -167,7 +167,7 @@ func (rf *Raft) startReplication(term int) bool {
 			if reply.ConflictTerm == invalidTerm {
 				rf.nextIndex[peer] = reply.ConflictIndex
 			} else {
-				firstTermIndex := rf.firstLogForLocked(reply.ConflictTerm)
+				firstTermIndex := rf.log.firstForLocked(reply.ConflictTerm)
 				if firstTermIndex != invalidIndex {
 					rf.nextIndex[peer] = firstTermIndex
 				} else {
@@ -181,8 +181,8 @@ func (rf *Raft) startReplication(term int) bool {
 				rf.nextIndex[peer] = prevNext
 			}
 
-			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at Prev=[%d]T%d, try next Prev=[%d]T%d", peer, args.PrevLogIndex, args.PrevLogTerm, rf.nextIndex[peer]-1, rf.log[rf.nextIndex[peer]-1].Term)
-			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Leader log=%v", peer, rf.logString())
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at Prev=[%d]T%d, try next Prev=[%d]T%d", peer, args.PrevLogIndex, args.PrevLogTerm, rf.nextIndex[peer]-1, rf.log.at(rf.nextIndex[peer]-1).Term)
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Leader log=%v", peer, rf.log.String())
 			return
 		}
 
@@ -194,7 +194,7 @@ func (rf *Raft) startReplication(term int) bool {
 		majorityMatched := rf.getMajorityIndexLocked()
 
 		// Figure 8: Leader不能提交非当前任期的日志
-		if majorityMatched > rf.commitIndex && rf.log[majorityMatched].Term == rf.currentTerm {
+		if majorityMatched > rf.commitIndex && rf.log.at(majorityMatched).Term == rf.currentTerm {
 			LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index: %d->%d", rf.commitIndex, majorityMatched)
 			rf.commitIndex = majorityMatched
 			rf.applyCond.Signal() // Signal后释放mu
@@ -213,13 +213,13 @@ func (rf *Raft) startReplication(term int) bool {
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
 			// 重要！！
-			rf.matchIndex[rf.me] = len(rf.log) - 1 // Leader自己当前的匹配下标
-			rf.nextIndex[rf.me] = len(rf.log)
+			rf.matchIndex[rf.me] = rf.log.size() - 1 // Leader自己当前的匹配下标
+			rf.nextIndex[rf.me] = rf.log.size()
 			continue
 		}
 
 		prevIdx := rf.nextIndex[peer] - 1
-		prevTerm := rf.log[prevIdx].Term
+		prevTerm := rf.log.at(prevIdx).Term
 
 		// 发起RPC
 		args := &AppendEntriesArgs{
@@ -227,7 +227,7 @@ func (rf *Raft) startReplication(term int) bool {
 			LeaderId:     rf.me,
 			PrevLogIndex: prevIdx,
 			PrevLogTerm:  prevTerm,
-			Entries:      rf.log[prevIdx+1:],
+			Entries:      rf.log.tail(prevIdx + 1),
 			LeaderCommit: rf.commitIndex,
 		}
 
@@ -244,21 +244,4 @@ func (rf *Raft) getMajorityIndexLocked() int {
 	sort.Ints(tmpIndices)
 	LOG(rf.me, rf.currentTerm, DDebug, "Majority index after sort: %v[%d]=%d", tmpIndices, len(tmpIndices)/2, tmpIndices[len(tmpIndices)/2])
 	return tmpIndices[len(tmpIndices)/2]
-}
-
-func (rf *Raft) logString() string {
-	var terms string
-	prevIdx := 0
-	prevTerm := 0
-	for idx, entry := range rf.log {
-		if entry.Term != prevTerm {
-			terms += fmt.Sprintf("[%d, %d]T%d ", prevIdx, idx-1, prevTerm)
-			prevTerm = entry.Term
-			prevIdx = idx
-		}
-		if idx == len(rf.log)-1 {
-			terms += fmt.Sprintf("[%d, %d]T%d", prevIdx, idx, prevTerm)
-		}
-	}
-	return terms
 }

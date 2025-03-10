@@ -70,7 +70,7 @@ func (reply *RequestVoteReply) String() string {
 
 // 比较Candidate与Follower的最后一个日志条目新旧
 func (rf *Raft) isMoreUpToDateLocked(candidateIndex, candidateTerm int) bool {
-	lastIndex, lastTerm := len(rf.log)-1, rf.log[len(rf.log)-1].Term
+	lastIndex, lastTerm := rf.log.last()
 	LOG(rf.me, rf.currentTerm, DVote, "Compare last log, Me: [%d]T%d, Candidate: [%d]T%d", lastIndex, lastTerm, candidateIndex, candidateTerm)
 
 	// Term 大者新
@@ -180,6 +180,7 @@ func (rf *Raft) startElection(term int) {
 		return
 	}
 
+	lastIdx, lastTerm := rf.log.last()
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
 			votes++
@@ -187,8 +188,8 @@ func (rf *Raft) startElection(term int) {
 			args := &RequestVoteArgs{
 				Term:         rf.currentTerm,
 				CandidateId:  rf.me,
-				LastLogIndex: len(rf.log) - 1,
-				LastLogTerm:  rf.log[len(rf.log)-1].Term,
+				LastLogIndex: lastIdx,
+				LastLogTerm:  lastTerm,
 			}
 			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Ask vote, args=%d", peer, args.String())
 			go askVoteFromPeer(args, peer)
