@@ -1,5 +1,10 @@
 package kvraft
 
+import (
+	"fmt"
+	"time"
+)
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
@@ -8,6 +13,41 @@ const (
 )
 
 type Err string
+
+type OperationType uint8
+
+const (
+	OpGet OperationType = iota
+	OpPut
+	OpAppend
+)
+
+const ClientRequestTimeout = 500 * time.Millisecond
+
+type Op struct {
+	// Your definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+	Key    string
+	Value  string
+	OpType OperationType
+}
+
+type OpReply struct {
+	Value string
+	Err   Err
+}
+
+func getOperationType(op string) OperationType {
+	switch op {
+	case "Put":
+		return OpPut
+	case "Append":
+		return OpAppend
+	default:
+		panic(fmt.Sprintf("unknown operation type: %s", op))
+	}
+}
 
 // Put or Append
 type PutAppendArgs struct {
