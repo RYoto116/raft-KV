@@ -19,10 +19,13 @@ func (rf *Raft) persistLocked() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	rf.log.persist(e)
 
+	// 将 RaftLog 除了snapshot 的部分进行序列化
+	rf.log.persist(e)
+	// 将 RaftLog 的 snapshot存入 raftstate 进行序列化
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.log.snapshot)
+
 	LOG(rf.me, rf.currentTerm, DPersist, "Persist: %v", rf.persistString())
 }
 
@@ -54,10 +57,19 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	rf.votedFor = votedFor
 
+	// 将 RaftLog 除了snapshot 的部分进行反序列化
 	if err := rf.log.readPersist(d); err != nil {
 		LOG(rf.me, rf.currentTerm, DPersist, "Read log error: %v", err)
 		return
 	}
+	// 通过 persister 读取 snapshot 进行反序列化
+	rf.log.snapshot = rf.persister.ReadSnapshot()
 
+	// 重要！！
+	// 基于测试框架的实现，所有 Snapshot 都是已提交的日志，因此宕机重启读取snapshot后需要比较更新 commitIndex和lastApplied
+	if rf.log.snapLastIdx > rf.commitIndex {
+		rf.commitIndex = rf.log.snapLastIdx
+		rf.lastApplied = rf.log.snapLastIdx
+	}
 	LOG(rf.me, rf.currentTerm, DPersist, "Read from persist: %v", rf.persistString())
 }

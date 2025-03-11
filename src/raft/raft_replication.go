@@ -79,7 +79,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.Term >= rf.currentTerm {
-		rf.becomeFollowerLocked(args.Term) // 将其他peers都变为Follower
+		rf.becomeFollowerLocked(args.Term) // 将其他peers（包含Candidate）都变为Follower
 	}
 
 	// 若Follower日志过短，则匹配失败，将ConflictIndex设为Follower的日志长度
@@ -113,13 +113,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		LOG(rf.me, rf.currentTerm, DApply, "Follower update the commit index: %d->%d", rf.commitIndex, args.LeaderCommit)
 		rf.commitIndex = args.LeaderCommit
-		rf.applyCond.Signal() // Signal唤醒阻塞在Wait()上的goroutine
+		rf.applyCond.Signal() // Signal唤醒阻塞在Wait()上的goroutine（peer）
 	}
 }
 
 // 心跳循环、日志同步，生命周期是一个term
 func (rf *Raft) replicationTicker(term int) {
-	for rf.killed() == false {
+	for !rf.killed() {
 		ok := rf.startReplication(term)
 		if !ok {
 			break // 心跳循环生命周期结束
@@ -137,6 +137,7 @@ func (rf *Raft) startReplication(term int) bool {
 
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
+
 		if !ok {
 			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, lost or error", peer)
 			return
@@ -157,7 +158,7 @@ func (rf *Raft) startReplication(term int) bool {
 			return
 		}
 
-		// 处理RPC响应参数
+		// 处理RPC响应值
 
 		// 若匹配失败，探测更小的nextIndex：回滚。
 		// 【难点】每回滚一次需要来回两次RPC。而replicationInterval是固定的，RPC次数过多，同步该peer日志的间隔过大，导致tester中日志同步超时
@@ -193,11 +194,11 @@ func (rf *Raft) startReplication(term int) bool {
 		// 更新commitIndex：所有peer匹配点的众数（超过半数的数-排序中位数）
 		majorityMatched := rf.getMajorityIndexLocked()
 
-		// Figure 8: Leader不能提交非当前任期的日志
+		// Figure 8: Leader不能提交不属于当前任期的日志
 		if majorityMatched > rf.commitIndex && rf.log.at(majorityMatched).Term == rf.currentTerm {
 			LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index: %d->%d", rf.commitIndex, majorityMatched)
 			rf.commitIndex = majorityMatched
-			rf.applyCond.Signal() // Signal后释放mu
+			rf.applyCond.Signal() // Signal后释放mu（Leader）
 		}
 	}
 
@@ -218,21 +219,37 @@ func (rf *Raft) startReplication(term int) bool {
 			continue
 		}
 
+		// 发起RPC，携带从nextIndex开始的日志项
+		// prevIdx 用于检测peer的本地日志是否与Leader保持同步
 		prevIdx := rf.nextIndex[peer] - 1
-		prevTerm := rf.log.at(prevIdx).Term
 
-		// 发起RPC
-		args := &AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: prevIdx,
-			PrevLogTerm:  prevTerm,
-			Entries:      rf.log.tail(prevIdx + 1),
-			LeaderCommit: rf.commitIndex,
+		// 如果部分日志已经被snapshot截断了，需要通过RPC将snapshot无脑同步给peer
+		if prevIdx < rf.log.snapLastIdx {
+			args := &InstallSnapshotArgs{
+				Term:              term,
+				LeaderId:          rf.me,
+				LastIncludedIndex: rf.log.snapLastIdx,
+				LastIncludedTerm:  rf.log.snapLastTerm,
+				Snapshot:          rf.log.snapshot, // 内存中
+			}
+
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Send InstallSnapshot, args=%v", peer, args.String())
+			go rf.installToPeer(term, args, peer)
+		} else {
+			prevTerm := rf.log.at(prevIdx).Term
+
+			args := &AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevIdx,
+				PrevLogTerm:  prevTerm,
+				Entries:      rf.log.tail(prevIdx + 1),
+				LeaderCommit: rf.commitIndex,
+			}
+
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, append entries, args=%v", peer, args.String())
+			go replicateToPeer(args, peer)
 		}
-
-		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, append entries, args=%v", peer, args.String())
-		go replicateToPeer(args, peer)
 	}
 
 	return true

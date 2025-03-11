@@ -20,7 +20,7 @@ func (rf *Raft) isElectionTimeoutLocked() bool {
 }
 
 func (rf *Raft) electionTicker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 
 		// Your code here (PartA)
 		// Check if a leader election should be started.

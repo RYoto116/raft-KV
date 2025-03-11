@@ -93,6 +93,8 @@ type Raft struct {
 	applyCh     chan ApplyMsg
 	applyCond   *sync.Cond
 
+	snapPending bool // TODO
+
 	// 选举周期控制
 	electionStart    time.Time
 	electionDuration time.Duration // 随机，避免“活锁”
@@ -154,21 +156,6 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.role == Leader
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-
-// 服务器不再需要参数中包含的snapshot，Raft需要截断这些日志并存储下来
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (PartD).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.log.doSnapshot(index, snapshot)
-	rf.persistLocked()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -260,6 +247,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu)
+
+	// TODO
+	rf.snapPending = false
 
 	// initialize from state persisted before a crash
 	// 若宕机重启，需要对部分字段反序列化
