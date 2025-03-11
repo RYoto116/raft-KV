@@ -110,12 +110,12 @@ func (rf *Raft) becomeFollowerLocked(term int) {
 	LOG(rf.me, rf.currentTerm, DLog, "%s->Follower, For T%d->T%d", rf.role, rf.currentTerm, term)
 	rf.role = Follower
 
-	ok := term != rf.currentTerm
+	shouldPersit := term != rf.currentTerm
 	if term > rf.currentTerm {
 		rf.votedFor = -1 // 进入新任期，重新投票
 	}
 	rf.currentTerm = term
-	if ok {
+	if shouldPersit {
 		rf.persistLocked()
 	}
 }
@@ -240,7 +240,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 1 // 由于InvalidTerm为了0，初始化term从1开始
 	rf.votedFor = -1
 
-	rf.log = NewLog(invalidIndex, invalidTerm, nil, nil)
+	rf.resetElectionTimeoutLocked()
+
+	rf.log = NewLog(InvalidIndex, InvalidTerm, nil, nil)
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -248,7 +250,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu)
 
-	// TODO
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.snapPending = false
 
 	// initialize from state persisted before a crash

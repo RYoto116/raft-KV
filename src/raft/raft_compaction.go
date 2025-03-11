@@ -113,7 +113,9 @@ func (rf *Raft) installToPeer(term int, args *InstallSnapshotArgs, peer int) {
 	}
 
 	// 更新match/next index，同时避免乱序更新
-	if rf.nextIndex[peer] < args.LastIncludedIndex {
+	// DEBUG: 把if比较的matchIndex误写为nextIndex
+	// 重要！！
+	if rf.matchIndex[peer] < args.LastIncludedIndex {
 		rf.matchIndex[peer] = args.LastIncludedIndex
 		rf.nextIndex[peer] = args.LastIncludedIndex + 1
 	}

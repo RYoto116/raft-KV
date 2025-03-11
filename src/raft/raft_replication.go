@@ -7,8 +7,8 @@ import (
 )
 
 const (
-	invalidTerm  int = 0
-	invalidIndex int = 0
+	InvalidTerm  int = 0
+	InvalidIndex int = 0
 )
 
 type LogEntry struct {
@@ -61,6 +61,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
+	// 对齐term
+	if args.Term < rf.currentTerm {
+		LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Reject log, higher term, T%d > T%d", args.LeaderId, rf.currentTerm, args.Term)
+		return
+	}
+
+	if args.Term >= rf.currentTerm {
+		rf.becomeFollowerLocked(args.Term) // 将其他peers（包含Candidate）都变为Follower
+	}
+
+	// DEBUG: 重置时钟必须放在对齐term之后！！
 	// 重要！！
 	// 收到AppendEntries RPC时，无论Follower接受还是拒绝日志，只要认可对方是Leader就要重置选举时钟
 	// 否则，如果Leader和Follower匹配日志所花时间特别长，Follower一直不重置选举时钟，就有可能错误地触发超时选举，变为新任期的Candidate
@@ -72,20 +83,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}()
 
-	// 对齐term
-	if args.Term < rf.currentTerm {
-		LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Reject log, higher term, T%d > T%d", args.LeaderId, rf.currentTerm, args.Term)
-		return
-	}
-
-	if args.Term >= rf.currentTerm {
-		rf.becomeFollowerLocked(args.Term) // 将其他peers（包含Candidate）都变为Follower
-	}
-
 	// 若Follower日志过短，则匹配失败，将ConflictIndex设为Follower的日志长度
 	if args.PrevLogIndex >= rf.log.size() {
 		reply.ConflictIndex = rf.log.size()
-		reply.ConflictTerm = invalidTerm
+		reply.ConflictTerm = InvalidTerm
 
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower's log too short, Len: %d <= PrevLog: %d", args.LeaderId, rf.log.size(), args.PrevLogIndex)
 		return
@@ -120,6 +121,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		LOG(rf.me, rf.currentTerm, DApply, "Follower update the commit index: %d->%d", rf.commitIndex, args.LeaderCommit)
 		rf.commitIndex = args.LeaderCommit
+
+		if rf.commitIndex > rf.log.size()-1 {
+			rf.commitIndex = rf.log.size() - 1
+		}
 		rf.applyCond.Signal() // Signal唤醒阻塞在Wait()上的goroutine（peer）
 	}
 }
@@ -171,12 +176,13 @@ func (rf *Raft) startReplication(term int) bool {
 		// 【难点】每回滚一次需要来回两次RPC。而replicationInterval是固定的，RPC次数过多，同步该peer日志的间隔过大，导致tester中日志同步超时
 		if !reply.Success {
 			prevIndex := rf.nextIndex[peer]
-			// ConflictTerm为空，说明Follower日志太短，
-			if reply.ConflictTerm == invalidTerm {
+			// ConflictTerm为空，说明Follower日志太短
+			if reply.ConflictTerm == InvalidTerm {
 				rf.nextIndex[peer] = reply.ConflictIndex
 			} else {
+				// ConflictTerm不为空，说明Follower与Leader在args.PrevLogIndex处不匹配
 				firstTermIndex := rf.log.firstForLocked(reply.ConflictTerm)
-				if firstTermIndex != invalidIndex {
+				if firstTermIndex != InvalidIndex {
 					rf.nextIndex[peer] = firstTermIndex
 				} else {
 					// Leader日志中不存在ConflictTerm期间的日志
@@ -190,7 +196,7 @@ func (rf *Raft) startReplication(term int) bool {
 			}
 
 			nextPrevIndex := rf.nextIndex[peer] - 1
-			nextPrevTerm := invalidTerm
+			nextPrevTerm := InvalidTerm
 			if nextPrevIndex >= rf.log.snapLastIdx {
 				nextPrevTerm = rf.log.at(nextPrevIndex).Term
 			}
@@ -255,7 +261,7 @@ func (rf *Raft) startReplication(term int) bool {
 				LeaderId:     rf.me,
 				PrevLogIndex: prevIdx,
 				PrevLogTerm:  prevTerm,
-				Entries:      rf.log.tail(prevIdx + 1),
+				Entries:      append([]LogEntry(nil), rf.log.tail(prevIdx+1)...),
 				LeaderCommit: rf.commitIndex,
 			}
 
@@ -268,9 +274,9 @@ func (rf *Raft) startReplication(term int) bool {
 }
 
 func (rf *Raft) getMajorityIndexLocked() int {
-	tmpIndices := make([]int, len(rf.matchIndex))
+	tmpIndices := make([]int, len(rf.peers))
 	copy(tmpIndices, rf.matchIndex)
 	sort.Ints(tmpIndices)
-	LOG(rf.me, rf.currentTerm, DDebug, "Majority index after sort: %v[%d]=%d", tmpIndices, len(tmpIndices)/2, tmpIndices[len(tmpIndices)/2])
-	return tmpIndices[len(tmpIndices)/2]
+	LOG(rf.me, rf.currentTerm, DDebug, "Majority index after sort: %v[%d]=%d", tmpIndices, (len(rf.peers)-1)/2, tmpIndices[(len(rf.peers)-1)/2])
+	return tmpIndices[(len(rf.peers)-1)/2]
 }

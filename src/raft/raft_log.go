@@ -89,7 +89,7 @@ func (rl *RaftLog) firstForLocked(term int) int {
 			break
 		}
 	}
-	return invalidIndex
+	return InvalidIndex
 }
 
 // index是全局日志下标，snapshot来自应用层
@@ -99,14 +99,13 @@ func (rl *RaftLog) doSnapshot(index int, snapshot []byte) {
 	}
 
 	idx := rl.idx(index) // 先计算idx，因为计算tailLog下标依赖于下方的snapLastIdx
-	size := rl.size()
 
 	rl.snapLastIdx = index
 	rl.snapLastTerm = rl.tailLog[idx].Term
 	rl.snapshot = snapshot
 
 	// 日志截断（深拷贝）
-	newLog := make([]LogEntry, 0, size-index)
+	newLog := make([]LogEntry, 0, len(rl.tailLog))
 	newLog = append(newLog, LogEntry{
 		Term: rl.snapLastTerm,
 	})
