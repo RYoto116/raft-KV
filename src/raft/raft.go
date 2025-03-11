@@ -252,7 +252,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.snapPending = false
 
 	// initialize from state persisted before a crash
-	// 若宕机重启，需要对部分字段反序列化
+	// 作用：宕机重启时加载server状态与配置
+	// 此时通过读取snapshot初始化lastApplied
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections

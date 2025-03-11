@@ -8,10 +8,22 @@ func (rf *Raft) applicationTicker() {
 		snapApply := rf.snapPending
 
 		// 1. apply线程是由日志同步唤醒的
-		// 收集上一次应用之后所有的日志条目
+		// 收集所有  的日志（）
 		entries := make([]LogEntry, 0)
 		if !snapApply {
-			for idx := rf.lastApplied + 1; idx <= rf.commitIndex; idx++ {
+			// 需要检查[lastAppiled + 1, commitIndex]是否超出tailLog区间，并适当剪裁
+			if rf.lastApplied < rf.log.snapLastIdx {
+				rf.lastApplied = rf.log.snapLastIdx
+			}
+
+			start := rf.lastApplied + 1
+			end := rf.commitIndex
+
+			if end >= rf.log.size() {
+				end = rf.log.size() - 1
+			}
+
+			for idx := start; idx <= end; idx++ {
 				entries = append(entries, rf.log.at(idx))
 			}
 		}

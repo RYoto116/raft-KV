@@ -48,8 +48,6 @@ func (rl *RaftLog) readPersist(d *labgob.LabDecoder) error {
 	}
 	rl.snapLastTerm = lastTerm
 
-	// TODO: snapshot反序列化
-
 	var log []LogEntry
 	if err := d.Decode(&log); err != nil {
 		return fmt.Errorf("decode tail log failed")
@@ -62,7 +60,6 @@ func (rl *RaftLog) readPersist(d *labgob.LabDecoder) error {
 func (rl *RaftLog) persist(e *labgob.LabEncoder) {
 	e.Encode(rl.snapLastIdx)
 	e.Encode(rl.snapLastTerm)
-	// TODO: snapshot序列化
 	e.Encode(rl.tailLog)
 }
 
@@ -97,14 +94,19 @@ func (rl *RaftLog) firstForLocked(term int) int {
 
 // index是全局日志下标，snapshot来自应用层
 func (rl *RaftLog) doSnapshot(index int, snapshot []byte) {
+	if index <= rl.snapLastIdx {
+		return
+	}
+
 	idx := rl.idx(index) // 先计算idx，因为计算tailLog下标依赖于下方的snapLastIdx
+	size := rl.size()
 
 	rl.snapLastIdx = index
 	rl.snapLastTerm = rl.tailLog[idx].Term
 	rl.snapshot = snapshot
 
 	// 日志截断（深拷贝）
-	newLog := make([]LogEntry, 0, len(rl.tailLog)-idx)
+	newLog := make([]LogEntry, 0, size-index)
 	newLog = append(newLog, LogEntry{
 		Term: rl.snapLastTerm,
 	})

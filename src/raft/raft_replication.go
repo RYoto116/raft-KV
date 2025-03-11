@@ -87,7 +87,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ConflictIndex = rf.log.size()
 		reply.ConflictTerm = invalidTerm
 
-		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower's log too short, Len: %d < PrevLog: %d", args.LeaderId, rf.log.size(), args.PrevLogIndex)
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower's log too short, Len: %d <= PrevLog: %d", args.LeaderId, rf.log.size(), args.PrevLogIndex)
+		return
+	}
+
+	if args.PrevLogIndex < rf.log.snapLastIdx {
+		reply.ConflictIndex = rf.log.snapLastIdx
+		reply.ConflictTerm = rf.log.snapLastTerm
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log, Follower log truncated in %d", args.LeaderId, rf.log.snapLastIdx)
 		return
 	}
 
@@ -163,7 +170,7 @@ func (rf *Raft) startReplication(term int) bool {
 		// 若匹配失败，探测更小的nextIndex：回滚。
 		// 【难点】每回滚一次需要来回两次RPC。而replicationInterval是固定的，RPC次数过多，同步该peer日志的间隔过大，导致tester中日志同步超时
 		if !reply.Success {
-			prevNext := rf.nextIndex[peer]
+			prevIndex := rf.nextIndex[peer]
 			// ConflictTerm为空，说明Follower日志太短，
 			if reply.ConflictTerm == invalidTerm {
 				rf.nextIndex[peer] = reply.ConflictIndex
@@ -178,11 +185,17 @@ func (rf *Raft) startReplication(term int) bool {
 			}
 
 			// 避免多次回退时，较早的回退RPC较晚到达Leader，使得nextIndex[peer]反而增大
-			if rf.nextIndex[peer] > prevNext {
-				rf.nextIndex[peer] = prevNext
+			if rf.nextIndex[peer] > prevIndex {
+				rf.nextIndex[peer] = prevIndex
 			}
 
-			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at Prev=[%d]T%d, try next Prev=[%d]T%d", peer, args.PrevLogIndex, args.PrevLogTerm, rf.nextIndex[peer]-1, rf.log.at(rf.nextIndex[peer]-1).Term)
+			nextPrevIndex := rf.nextIndex[peer] - 1
+			nextPrevTerm := invalidTerm
+			if nextPrevIndex >= rf.log.snapLastIdx {
+				nextPrevTerm = rf.log.at(nextPrevIndex).Term
+			}
+
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Not matched at Prev=[%d]T%d, try next Prev=[%d]T%d", peer, args.PrevLogIndex, args.PrevLogTerm, nextPrevIndex, nextPrevTerm)
 			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Leader log=%v", peer, rf.log.String())
 			return
 		}
@@ -223,10 +236,10 @@ func (rf *Raft) startReplication(term int) bool {
 		// prevIdx 用于检测peer的本地日志是否与Leader保持同步
 		prevIdx := rf.nextIndex[peer] - 1
 
-		// 如果部分日志已经被snapshot截断了，需要通过RPC将snapshot无脑同步给peer
+		// Leader发送entries时要检查发送的PrevLogEntry还在不在，如果不在需要先同步snapshot
 		if prevIdx < rf.log.snapLastIdx {
 			args := &InstallSnapshotArgs{
-				Term:              term,
+				Term:              rf.currentTerm,
 				LeaderId:          rf.me,
 				LastIncludedIndex: rf.log.snapLastIdx,
 				LastIncludedTerm:  rf.log.snapLastTerm,
@@ -237,7 +250,6 @@ func (rf *Raft) startReplication(term int) bool {
 			go rf.installToPeer(term, args, peer)
 		} else {
 			prevTerm := rf.log.at(prevIdx).Term
-
 			args := &AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,

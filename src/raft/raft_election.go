@@ -191,7 +191,7 @@ func (rf *Raft) startElection(term int) {
 				LastLogIndex: lastIdx,
 				LastLogTerm:  lastTerm,
 			}
-			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Ask vote, args=%d", peer, args.String())
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Ask vote, args=%v", peer, args.String())
 			go askVoteFromPeer(args, peer)
 		}
 	}
