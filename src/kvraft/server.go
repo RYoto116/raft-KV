@@ -32,12 +32,24 @@ type KVServer struct {
 	lastApplied  int
 	stateMachine *MemoryKVStateMachine
 	notifyChans  map[int]chan *OpReply
+
+	// 去重表，clientId到最后一次操作seqId的映射
+	duplicateTable map[int64]LastOperationInfo
+}
+
+type LastOperationInfo struct {
+	SeqId int64
+	Reply *OpReply
+}
+
+func (kv *KVServer) isRequestDuplicate(clientId, seqId int64) bool {
+	info, ok := kv.duplicateTable[clientId]
+	return ok && seqId <= info.SeqId
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	// 调用raft模块，将请求存储到raft日志中进行同步
-
+	// 调用raft模块，将操作请求Op存储到applyCh中，通过raft进行同步
 	index, _, isLeader := kv.rf.Start(Op{
 		Key:    args.Key,
 		OpType: OpGet,
@@ -49,7 +61,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	// TODO: 等待Get结果
+	// 等待Get结果
 	kv.mu.Lock()
 	notifyCh := kv.getNotifyChannel(index)
 	kv.mu.Unlock()
@@ -73,11 +85,22 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	// 判断请求是否重复
+	kv.mu.Lock()
+	if kv.isRequestDuplicate(args.ClientId, args.SeqId) {
+		opReply := kv.duplicateTable[args.ClientId].Reply
+		reply.Err = opReply.Err
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
 
 	index, _, isLeader := kv.rf.Start(Op{
-		Key:    args.Key,
-		Value:  args.Value,
-		OpType: getOperationType(args.Op),
+		Key:      args.Key,
+		Value:    args.Value,
+		OpType:   getOperationType(args.Op),
+		ClientId: args.ClientId,
+		SeqId:    args.SeqId,
 	})
 
 	// 如果当前KVServer不是Leader，直接返回错误
@@ -85,7 +108,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	// TODO: 等待Put/Append结果
+	// 等待Put/Append结果
 	kv.mu.Lock()
 	notifyCh := kv.getNotifyChannel(index)
 	kv.mu.Unlock()
@@ -148,12 +171,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh) // kv.applyCh用于初始化raft模块
 
 	// You may need initialization code here.
 	kv.dead = 0
 	kv.lastApplied = 0
 	kv.stateMachine = NewMemoryKVMachine()
+	kv.notifyChans = make(map[int]chan *OpReply)
+
+	kv.duplicateTable = make(map[int64]LastOperationInfo)
 
 	go kv.applyTask()
 	return kv
@@ -163,9 +189,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 func (kv *KVServer) applyTask() {
 	for !kv.killed() {
 		select {
-		case message := <-kv.applyCh:
+		case message := <-kv.applyCh: // applyCh中的message是经过raft_application提交后需要应用的日志
 			if message.CommandValid {
 				kv.mu.Lock()
+
 				// 忽略已经处理过的消息
 				if message.CommandIndex <= kv.lastApplied {
 					kv.mu.Unlock()
@@ -177,8 +204,23 @@ func (kv *KVServer) applyTask() {
 				// 取出用户的操作信息
 				op := message.Command.(Op)
 
-				// 将操作应用到状态机中
-				opReply := kv.applyToStateMachine(op)
+				var opReply *OpReply
+
+				// message可能是乱序的。为了保持线性一致性需要在日志应用时判断同一客户端的操作是顺序的
+				if op.OpType != OpGet && kv.isRequestDuplicate(op.ClientId, op.SeqId) {
+					opReply = kv.duplicateTable[op.ClientId].Reply
+				} else {
+					// 将操作应用到状态机中
+					opReply = kv.applyToStateMachine(op)
+
+					// 更新duplicateTable
+					if op.OpType != OpGet {
+						kv.duplicateTable[op.ClientId] = LastOperationInfo{
+							SeqId: op.SeqId,
+							Reply: opReply,
+						}
+					}
+				}
 
 				// 重要！！
 				// 由 Leader 将reply发送回对应的server

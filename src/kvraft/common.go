@@ -6,10 +6,11 @@ import (
 )
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongLeader = "ErrWrongLeader"
-	ErrTimeout     = "ErrTimeout"
+	OK                  = "OK"
+	ErrNoKey            = "ErrNoKey"
+	ErrWrongLeader      = "ErrWrongLeader"
+	ErrTimeout          = "ErrTimeout"
+	ErrDuplicateRequest = "ErrDuplicateRequest"
 )
 
 type Err string
@@ -28,9 +29,11 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Key    string
-	Value  string
-	OpType OperationType
+	Key      string
+	Value    string
+	OpType   OperationType
+	ClientId int64
+	SeqId    int64
 }
 
 type OpReply struct {
@@ -51,12 +54,14 @@ func getOperationType(op string) OperationType {
 
 // Put or Append
 type PutAppendArgs struct {
-	Key   string
-	Value string
-	Op    string // "Put" or "Append"
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key      string
+	Value    string
+	Op       string // "Put" or "Append"
+	ClientId int64
+	SeqId    int64
 }
 
 type PutAppendReply struct {

@@ -10,6 +10,10 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	leaderId int // 记录Leader节点ID，避免下一次请求轮询查找Leader
+
+	// 实现线性一致性：clientId+seqId唯一标识一条请求
+	clientId int64
+	seqId    int64 // 同一客户端的seqId递增
 }
 
 func nrand() int64 {
@@ -24,6 +28,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.leaderId = 0
+	ck.clientId = nrand()
+	ck.seqId = 0
+
 	return ck
 }
 
@@ -56,6 +63,7 @@ func (ck *Clerk) Get(key string) string {
 		// 请求成功，返回value
 		return reply.Value
 	}
+	// Get方法不会改变状态机的状态，不需要分配seqId
 }
 
 // shared by Put and Append.
@@ -69,9 +77,11 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	args := &PutAppendArgs{
-		Key:   key,
-		Value: value,
-		Op:    op,
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClientId: ck.clientId,
+		SeqId:    ck.seqId, // 线性一致性：clientId+seqId唯一标识一条请求
 	}
 
 	reply := &PutAppendReply{}
@@ -82,6 +92,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 			continue
 		}
+
+		// 写请求成功，seqId递增
+		ck.seqId++
 		return
 	}
 }
