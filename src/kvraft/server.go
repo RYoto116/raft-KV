@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"course/labgob"
 	"course/labrpc"
 	"course/raft"
@@ -181,6 +182,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.duplicateTable = make(map[int64]LastOperationInfo)
 
+	// 从snapshot中恢复数据
+	kv.restoreFromSnapshot(persister.ReadSnapshot())
+
 	go kv.applyTask()
 	return kv
 }
@@ -230,6 +234,17 @@ func (kv *KVServer) applyTask() {
 					kv.getNotifyChannel(message.CommandIndex) <- opReply
 				}
 
+				// 判断当前server是否需要snapshot（server本地日志大小是否超过阈值）
+				if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+					kv.makeSnapshot(message.CommandIndex)
+				}
+
+				kv.mu.Unlock()
+
+			} else if message.SnapshotValid { // message是Snapshot类型，需要恢复状态机状态
+				kv.mu.Lock()
+				kv.restoreFromSnapshot(message.Snapshot)
+				kv.lastApplied = message.SnapshotIndex
 				kv.mu.Unlock()
 			}
 		}
@@ -260,4 +275,31 @@ func (kv *KVServer) getNotifyChannel(index int) chan *OpReply {
 
 func (kv *KVServer) removeNotifyChannel(index int) {
 	delete(kv.notifyChans, index)
+}
+
+// 对statemachine中的数据以及去重表进行snapshot持久化
+func (kv *KVServer) makeSnapshot(index int) {
+	buf := new(bytes.Buffer)
+	e := labgob.NewEncoder(buf)
+	e.Encode(kv.stateMachine)
+	e.Encode(kv.duplicateTable)
+
+	kv.rf.Snapshot(index, buf.Bytes())
+}
+
+func (kv *KVServer) restoreFromSnapshot(snaphot []byte) {
+	if len(snaphot) == 0 {
+		return
+	}
+
+	buf := bytes.NewBuffer(snaphot)
+	d := labgob.NewDecoder(buf)
+	var stateMachine MemoryKVStateMachine
+	var duplicateTable map[int64]LastOperationInfo
+
+	if d.Decode(&stateMachine) != nil || d.Decode(&duplicateTable) != nil {
+		panic("failed to restore from snashot")
+	}
+	kv.stateMachine = &stateMachine
+	kv.duplicateTable = duplicateTable
 }
