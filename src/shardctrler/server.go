@@ -18,7 +18,7 @@ type ShardCtrler struct {
 	// Your data here.
 	dead           int32
 	lastApplied    int
-	stateMachine   *MemoryKVStateMachine
+	stateMachine   *CtrlerStateMachine
 	notifyChans    map[int]chan *OpReply
 	duplicateTable map[int64]LastOperationInfo
 
@@ -35,6 +35,7 @@ func (sc *ShardCtrler) isRequestDuplicate(clientId, seqId int64) bool {
 	return ok && seqId <= info.SeqId
 }
 
+// 向集群添加一个Group，需要处理负载均衡问题
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
 	sc.mu.Lock()
@@ -55,9 +56,9 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	}, &opReply)
 
 	reply.Err = opReply.Err
-	// reply.WrongLeader = opReply.WrongLeader
 }
 
+// 将若干个group从集群中删除
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
 	sc.mu.Lock()
@@ -78,7 +79,6 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	}, &opReply)
 
 	reply.Err = opReply.Err
-	// reply.WrongLeader = opReply.WrongLeader
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
@@ -115,7 +115,6 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 	reply.Config = opReply.ControllerConfig
 	reply.Err = opReply.Err
-	// reply.WrongLeader = opReply.WrongLeader
 }
 
 // 操作通用方法
@@ -123,13 +122,13 @@ func (sc *ShardCtrler) command(args Op, reply *OpReply) {
 	index, _, isLeader := sc.rf.Start(args)
 
 	if !isLeader {
-		reply.WrongLeader = true
 		reply.Err = ErrWrongLeader
 		return
 	}
 
 	sc.mu.Lock()
-	notifyCh := sc.notifyChans[index]
+	// 重要！！不能直接访问notifyChans[index]
+	notifyCh := sc.getNotifyChannel(index)
 	sc.mu.Unlock()
 
 	select {
@@ -176,7 +175,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.me = me
 
 	sc.configs = make([]Config, 1)
-	sc.configs[0].Groups = map[int][]string{}
+	sc.configs[0].Groups = map[int][]string{} // 默认配置
 
 	labgob.Register(Op{})
 	sc.applyCh = make(chan raft.ApplyMsg)
@@ -186,7 +185,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.dead = 0
 	sc.lastApplied = 0
 
-	sc.stateMachine = nil // TODO
+	sc.stateMachine = NewCtrlerStateMachine() // TODO
 
 	sc.notifyChans = make(map[int]chan *OpReply)
 	sc.duplicateTable = make(map[int64]LastOperationInfo)
@@ -239,14 +238,14 @@ func (sc *ShardCtrler) applyToStateMachine(op Op) *OpReply {
 	var reply OpReply
 
 	switch op.OpType {
-	// case OpJoin:
-	// 	reply.Err = sc.stateMachine.Join(op.Servers)
-	// case OpLeave:
-	// 	reply.Err = sc.stateMachine.Leave(op.GIDs)
-	// case OpMove:
-	// 	reply.Err = sc.stateMachine.Move(op.Shard, op.GID)
-	// case OpQuery:
-	// 	reply.Config, reply.Err = sc.stateMachine.Query(op.Num)
+	case OpJoin:
+		reply.Err = sc.stateMachine.Join(op.Servers)
+	case OpLeave:
+		reply.Err = sc.stateMachine.Leave(op.GIDs)
+	case OpMove:
+		reply.Err = sc.stateMachine.Move(op.Shard, op.GID)
+	case OpQuery:
+		reply.ControllerConfig, reply.Err = sc.stateMachine.Query(op.Num)
 	}
 
 	return &reply
@@ -254,7 +253,7 @@ func (sc *ShardCtrler) applyToStateMachine(op Op) *OpReply {
 
 func (sc *ShardCtrler) getNotifyChannel(index int) chan *OpReply {
 	if _, ok := sc.notifyChans[index]; !ok {
-		sc.notifyChans[index] = make(chan *OpReply)
+		sc.notifyChans[index] = make(chan *OpReply, 1) // 重要！！缓冲，否则过不了Historical queries test
 	}
 	return sc.notifyChans[index]
 }

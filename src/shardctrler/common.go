@@ -30,6 +30,12 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func DefaultConfig() Config {
+	return Config{
+		Groups: make(map[int][]string),
+	}
+}
+
 const (
 	OK                  = "OK"
 	ErrNoKey            = "ErrNoKey"
