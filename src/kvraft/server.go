@@ -227,8 +227,7 @@ func (kv *KVServer) applyTask() {
 				}
 
 				// 重要！！
-				// 由 Leader 将reply发送回对应的server
-				// 并发场景下，如果由其他节点发送opReply可能出现数据不一致，影响线性一致性
+				// 由Leader收集reply，通过RPC返回给客户端
 				if _, isLeader := kv.rf.GetState(); isLeader {
 					// 构造reply channel，发送opReply
 					kv.getNotifyChannel(message.CommandIndex) <- opReply
