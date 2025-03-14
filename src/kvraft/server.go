@@ -81,7 +81,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		kv.removeNotifyChannel(index)
 		kv.mu.Unlock()
 	}()
-
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {

@@ -2,8 +2,6 @@ package shardctrler
 
 import "sort"
 
-// TODO
-
 type CtrlerStateMachine struct {
 	Configs []Config
 }

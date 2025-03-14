@@ -1,17 +1,15 @@
 package shardkv
 
 import (
+	"bytes"
 	"course/labgob"
 	"course/labrpc"
 	"course/raft"
+	"course/shardctrler"
 	"sync"
+	"sync/atomic"
+	"time"
 )
-
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-}
 
 type ShardKV struct {
 	mu           sync.Mutex
@@ -24,14 +22,123 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	dead           int32
+	lastApplied    int
+	stateMachine   *MemoryKVStateMachine
+	notifyChans    map[int]chan *OpReply
+	duplicateTable map[int64]LastOperationInfo
+
+	currentConfig shardctrler.Config
+	mck           *shardctrler.Clerk
+}
+
+type LastOperationInfo struct {
+	SeqId int64
+	Reply *OpReply
+}
+
+func (kv *ShardKV) isRequestDuplicate(clientId, seqId int64) bool {
+	info, ok := kv.duplicateTable[clientId]
+	return ok && seqId <= info.SeqId
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	// 判断key是否属于当前server所属group负责的shard
+	kv.mu.Lock()
+	if !kv.matchGroup(args.Key) {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	// 调用raft模块，将操作请求Op存储到applyCh中，通过raft进行同步
+	index, _, isLeader := kv.rf.Start(Op{
+		Key:    args.Key,
+		OpType: OpGet,
+	})
+
+	// 如果当前KVServer不是Leader，直接返回错误
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// 等待Get结果
+	kv.mu.Lock()
+	notifyCh := kv.getNotifyChannel(index)
+	kv.mu.Unlock()
+
+	select {
+	case result := <-notifyCh:
+		reply.Value = result.Value
+		reply.Err = result.Err
+	case <-time.After(ClientRequestTimeout):
+		reply.Err = ErrTimeout
+	}
+
+	// 异步删除reply channel
+	go func() {
+		kv.mu.Lock()
+		kv.removeNotifyChannel(index)
+		kv.mu.Unlock()
+	}()
+
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	// 判断key是否属于当前server所属group负责的shard
+	kv.mu.Lock()
+	if !kv.matchGroup(args.Key) {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	// 判断请求是否重复
+	kv.mu.Lock()
+	if kv.isRequestDuplicate(args.ClientId, args.SeqId) {
+		opReply := kv.duplicateTable[args.ClientId].Reply
+		reply.Err = opReply.Err
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	index, _, isLeader := kv.rf.Start(Op{
+		Key:      args.Key,
+		Value:    args.Value,
+		OpType:   getOperationType(args.Op),
+		ClientId: args.ClientId,
+		SeqId:    args.SeqId,
+	})
+
+	// 如果当前KVServer不是Leader，直接返回错误
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// 等待Put/Append结果
+	kv.mu.Lock()
+	notifyCh := kv.getNotifyChannel(index)
+	kv.mu.Unlock()
+
+	select {
+	case result := <-notifyCh:
+		reply.Err = result.Err
+	case <-time.After(ClientRequestTimeout):
+		reply.Err = ErrTimeout
+	}
+
+	// 异步删除reply channel
+	go func() {
+		kv.mu.Lock()
+		kv.removeNotifyChannel(index)
+		kv.mu.Unlock()
+	}()
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -39,8 +146,14 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
 func (kv *ShardKV) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+}
+
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
 }
 
 // servers[] contains the ports of the servers in this group.
@@ -82,12 +195,87 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
+	kv.dead = 0
+	kv.lastApplied = 0
+	kv.stateMachine = NewMemoryKVMachine()
+	kv.notifyChans = make(map[int]chan *OpReply)
+	kv.duplicateTable = make(map[int64]LastOperationInfo)
+
+	// 初始化默认配置
+	// 需要后台线程不断从shardCtrler获取集群的最新配置
+	kv.currentConfig = shardctrler.DefaultConfig()
 
 	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+	// 初始化shardCtrler客户端，以获取最新配置
+	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.restoreFromSnapshot(persister.ReadSnapshot())
+
+	go kv.applyTask()
+
+	// 后台获取最新配置
+	go kv.fetchConfigTask()
+
 	return kv
+}
+
+func (kv *ShardKV) applyToStateMachine(op Op) *OpReply {
+	var reply OpReply
+
+	switch op.OpType {
+	case OpGet:
+		reply.Value, reply.Err = kv.stateMachine.Get(op.Key)
+	case OpPut:
+		reply.Err = kv.stateMachine.Put(op.Key, op.Value)
+	case OpAppend:
+		reply.Err = kv.stateMachine.Append(op.Key, op.Value)
+	}
+
+	return &reply
+}
+
+func (kv *ShardKV) getNotifyChannel(index int) chan *OpReply {
+	if _, ok := kv.notifyChans[index]; !ok {
+		kv.notifyChans[index] = make(chan *OpReply, 1) // 创建一个容量为 1 的有缓冲区的通道
+	}
+	return kv.notifyChans[index]
+}
+
+func (kv *ShardKV) removeNotifyChannel(index int) {
+	delete(kv.notifyChans, index)
+}
+
+// 对statemachine中的数据以及去重表进行snapshot持久化
+func (kv *ShardKV) makeSnapshot(index int) {
+	buf := new(bytes.Buffer)
+	e := labgob.NewEncoder(buf)
+	e.Encode(kv.stateMachine)
+	e.Encode(kv.duplicateTable)
+
+	kv.rf.Snapshot(index, buf.Bytes())
+}
+
+func (kv *ShardKV) restoreFromSnapshot(snaphot []byte) {
+	if len(snaphot) == 0 {
+		return
+	}
+
+	buf := bytes.NewBuffer(snaphot)
+	d := labgob.NewDecoder(buf)
+	var stateMachine MemoryKVStateMachine
+	var duplicateTable map[int64]LastOperationInfo
+
+	if d.Decode(&stateMachine) != nil || d.Decode(&duplicateTable) != nil {
+		panic("failed to restore from snashot")
+	}
+	kv.stateMachine = &stateMachine
+	kv.duplicateTable = duplicateTable
+}
+
+func (kv *ShardKV) matchGroup(key string) bool {
+	shard := key2shard(key)
+	return kv.gid == kv.currentConfig.Shards[shard]
 }
