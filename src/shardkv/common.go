@@ -20,6 +20,7 @@ const (
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrTimeout     = "ErrTimeout"
+	ErrWrongConfig = "ErrWrongConfig"
 )
 
 type Err string
@@ -89,4 +90,17 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type RaftCommandType uint8
+
+const (
+	ClientOperation RaftCommandType = iota
+	ConfigChange                    // 包括shard迁移、shard清理
+)
+
+// 传入 raft 模块的操作类型
+type RaftCommand struct {
+	CmdType RaftCommandType
+	Data    interface{} // ClientOperation -> Op, ConfigChange -> Config
 }
