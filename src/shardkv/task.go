@@ -1,6 +1,9 @@
 package shardkv
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 func (kv *ShardKV) applyTask() {
 	for !kv.killed() {
@@ -67,7 +70,8 @@ func (kv *ShardKV) applyTask() {
 	}
 }
 
-// 获取当前配置。shardkv 需要定时从 shardctrler 这边拉取最新的配置，然后根据配置来确定哪些 shard 应该是需要进行迁移的
+// shardkv 需要定时从 shardctrler 这边拉取最新的配置，然后根据配置来确定哪些 shard 应该是需要进行迁移的
+// fetchConfigTask 定期从 shardctrler 拉取配置，拿到配置后构造一个配置变更的命令，传入到 raft 模块中进行状态同步。
 func (kv *ShardKV) fetchConfigTask() {
 	for !kv.killed() {
 		kv.mu.Lock()
@@ -84,4 +88,172 @@ func (kv *ShardKV) fetchConfigTask() {
 
 		time.Sleep(FetchConfigInterval)
 	}
+}
+
+func (kv *ShardKV) shardMigrationTask() {
+	for !kv.killed() {
+		// 由Leader进行shard迁移
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			kv.mu.Lock()
+
+			// 寻找需要迁移进来的gid -> shards
+			gidToShards := kv.getShardByStatus(MoveIn)
+
+			// 通过RPC向上述group请求shard状态机数据
+			var wg sync.WaitGroup
+			for gid, shards := range gidToShards {
+				wg.Add(1) // 为什么？
+				// 参数：上一个配置的servers，当前配置编号，需要迁移的shard IDs
+				go func(servers []string, configNum int, shardIDs []int) {
+					defer wg.Done()
+
+					args := ShardOperationArgs{
+						ConfigNum: configNum,
+						ShardIDs:  shardIDs,
+					}
+					// 遍历group当中每个节点，从Leader中读取对应的shard状态机数据
+					for _, server := range servers {
+						srv := kv.make_end(server)
+						var reply ShardOperationReply
+						ok := srv.Call("ShardKV.GetShardsData", &args, &reply)
+
+						// 获取到shards数据，执行shard迁移
+						if ok && reply.Err == OK {
+							kv.ConfigCommand(RaftCommand{
+								CmdType: ShardMigration,
+								Data:    reply,
+							}, &OpReply{})
+						}
+					}
+				}(kv.prevConfig.Groups[gid], kv.currentConfig.Num, shards)
+			}
+
+			kv.mu.Unlock()
+			wg.Wait()
+		}
+
+		time.Sleep(ShardMigrationInterval)
+	}
+}
+
+// shard清理：通过 RPC 修改shard状态 GC -> Normal，MoveOut -> 删除
+func (kv *ShardKV) shardGCTask() {
+	for !kv.killed() {
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			kv.mu.Lock()
+
+			gidToShards := kv.getShardByStatus(GC)
+
+			var wg sync.WaitGroup
+			for gid, shards := range gidToShards {
+				wg.Add(1) // 为什么？
+
+				go func(servers []string, configNum int, shardIDs []int) {
+					defer wg.Done()
+
+					args := ShardOperationArgs{
+						ConfigNum: configNum,
+						ShardIDs:  shardIDs,
+					}
+
+					// Leader向旧group的Leader发送RPC请求，删除旧group中shard数据（在旧group的状态为MoveOut）
+					for _, server := range servers {
+						var reply ShardOperationReply
+						srv := kv.make_end(server)
+						ok := srv.Call("ShardKV.DeleteShardsData", &args, &reply)
+
+						if ok && reply.Err == OK {
+							// Leader 同步日志，将当前group中处于GC状态的shard变为Normal
+							kv.ConfigCommand(RaftCommand{
+								CmdType: ShardGC,
+								Data:    args,
+							}, &OpReply{})
+						}
+					}
+
+				}(kv.currentConfig.Groups[gid], kv.currentConfig.Num, shards)
+			}
+
+			kv.mu.Unlock()
+			wg.Wait()
+		}
+
+		time.Sleep(ShardGCInterval)
+	}
+}
+
+// 查找group中对应状态的shard
+func (kv *ShardKV) getShardByStatus(status ShardStatus) map[int][]int {
+	gidToShards := make(map[int][]int)
+	for i, shard := range kv.shards {
+		if shard.Status == status {
+			// 重要！！获取shard原先所属的group
+			gid := kv.prevConfig.Shards[i]
+			if gid != 0 {
+				if _, ok := gidToShards[gid]; !ok {
+					gidToShards[gid] = make([]int, 0)
+				}
+				gidToShards[gid] = append(gidToShards[gid], i)
+			}
+		}
+	}
+	return gidToShards
+}
+
+func (kv *ShardKV) GetShardsData(args *ShardOperationArgs, reply *ShardOperationReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// 判断kv当前配置是否是RPC请求所需要的
+	if kv.currentConfig.Num < args.ConfigNum {
+		reply.Err = ErrNotReady
+		return
+	}
+
+	// 拷贝状态机数据
+	reply.ShardData = make(map[int]map[string]string)
+	for _, i := range args.ShardIDs {
+		if _, ok := kv.shards[i]; ok {
+			reply.ShardData[i] = kv.shards[i].copyKV()
+		}
+	}
+
+	// 拷贝去重表数据，保证配置变更的线性一致性
+	reply.DuplicateTable = make(map[int64]LastOperationInfo)
+	for clientId, info := range kv.duplicateTable {
+		reply.DuplicateTable[clientId] = info.copyData()
+	}
+
+	reply.ConfigNum, reply.Err = args.ConfigNum, OK
+}
+
+func (kv *ShardKV) DeleteShardsData(args *ShardOperationArgs, reply *ShardOperationReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// 如果server当前状态比args中的状态更新，则不需要删除shard
+	if kv.currentConfig.Num > args.ConfigNum {
+		reply.Err = OK
+		return
+	}
+
+	// Leader 同步日志，进行状态机删除
+	var opReply OpReply
+	kv.ConfigCommand(RaftCommand{
+		CmdType: ShardGC,
+		Data:    *args,
+	}, &opReply)
+
+	reply.Err = opReply.Err
+
 }

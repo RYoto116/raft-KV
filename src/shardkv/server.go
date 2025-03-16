@@ -29,13 +29,9 @@ type ShardKV struct {
 	notifyChans    map[int]chan *OpReply
 	duplicateTable map[int64]LastOperationInfo
 
+	prevConfig    shardctrler.Config // 配置变更时shard迁移需要获取之前配置中shard所属的gid
 	currentConfig shardctrler.Config
 	mck           *shardctrler.Clerk
-}
-
-type LastOperationInfo struct {
-	SeqId int64
-	Reply *OpReply
 }
 
 func (kv *ShardKV) isRequestDuplicate(clientId, seqId int64) bool {
@@ -88,7 +84,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		kv.removeNotifyChannel(index)
 		kv.mu.Unlock()
 	}()
-
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -210,6 +205,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.duplicateTable = make(map[int64]LastOperationInfo)
 
 	// 初始化默认配置
+	kv.prevConfig = shardctrler.DefaultConfig()
 	// 需要后台线程不断从shardCtrler获取集群的最新配置
 	kv.currentConfig = shardctrler.DefaultConfig()
 
@@ -226,6 +222,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	// 后台获取最新配置
 	go kv.fetchConfigTask() // 调用kv.ConfigCommand
+
+	go kv.shardMigrationTask()
+
+	go kv.shardGCTask()
 
 	return kv
 }

@@ -21,6 +21,7 @@ const (
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrTimeout     = "ErrTimeout"
 	ErrWrongConfig = "ErrWrongConfig"
+	ErrNotReady    = "ErrNotReady"
 )
 
 type Err string
@@ -34,8 +35,10 @@ const (
 )
 
 const (
-	ClientRequestTimeout = 500 * time.Millisecond
-	FetchConfigInterval  = 100 * time.Millisecond
+	ClientRequestTimeout   = 500 * time.Millisecond
+	FetchConfigInterval    = 100 * time.Millisecond
+	ShardMigrationInterval = 50 * time.Millisecond
+	ShardGCInterval        = 50 * time.Millisecond
 )
 
 type Op struct {
@@ -62,6 +65,22 @@ func getOperationType(op string) OperationType {
 		return OpAppend
 	default:
 		panic(fmt.Sprintf("unknown operation type: %s", op))
+	}
+}
+
+type LastOperationInfo struct {
+	SeqId int64
+	Reply *OpReply
+}
+
+// 去重表拷贝函数
+func (info *LastOperationInfo) copyData() LastOperationInfo {
+	return LastOperationInfo{
+		SeqId: info.SeqId,
+		Reply: &OpReply{
+			Value: info.Reply.Value,
+			Err:   info.Reply.Err,
+		},
 	}
 }
 
@@ -96,11 +115,37 @@ type RaftCommandType uint8
 
 const (
 	ClientOperation RaftCommandType = iota
-	ConfigChange                    // 包括shard迁移、shard清理
+	ConfigChange
+	ShardMigration
+	ShardGC
 )
 
 // 传入 raft 模块的操作类型
 type RaftCommand struct {
 	CmdType RaftCommandType
-	Data    interface{} // ClientOperation -> Op, ConfigChange -> Config
+	Data    interface{}
+	// ClientOperation -> Op, ConfigChange -> Config
+	// ShardMigration  -> ShardOperationReply
+	// ShardGC         -> ShardOperationArgs
 }
+
+type ShardOperationArgs struct {
+	ConfigNum int
+	ShardIDs  []int
+}
+
+type ShardOperationReply struct {
+	ConfigNum      int
+	ShardData      map[int]map[string]string
+	DuplicateTable map[int64]LastOperationInfo
+	Err            Err
+}
+
+type ShardStatus uint8
+
+const (
+	Normal ShardStatus = iota
+	MoveIn
+	MoveOut
+	GC
+)
