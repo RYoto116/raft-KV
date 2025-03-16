@@ -82,6 +82,7 @@ func (ck *Clerk) Get(key string) string {
 			if _, exist := ck.leaderIds[gid]; !exist {
 				ck.leaderIds[gid] = 0
 			}
+			oldLeaderId := ck.leaderIds[gid]
 
 			for {
 				srv := ck.make_end(servers[ck.leaderIds[gid]])
@@ -96,6 +97,10 @@ func (ck *Clerk) Get(key string) string {
 				// ... not ok, or ErrWrongLeader
 				if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
 					ck.leaderIds[gid] = (ck.leaderIds[gid] + 1) % len(servers)
+
+					if ck.leaderIds[gid] == oldLeaderId {
+						break
+					}
 				}
 			}
 		}
@@ -122,13 +127,16 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			if _, exist := ck.leaderIds[gid]; !exist {
 				ck.leaderIds[gid] = 0
 			}
+			oldLeaderId := ck.leaderIds[gid]
 
 			for {
 				srv := ck.make_end(servers[ck.leaderIds[gid]])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
+
 					ck.seqId++
+
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
@@ -137,6 +145,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				// ... not ok, or ErrWrongLeader
 				if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
 					ck.leaderIds[gid] = (ck.leaderIds[gid] + 1) % len(servers)
+
+					if ck.leaderIds[gid] == oldLeaderId {
+						break
+					}
 				}
 			}
 		}

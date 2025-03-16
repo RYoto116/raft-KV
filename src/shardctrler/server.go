@@ -185,7 +185,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.dead = 0
 	sc.lastApplied = 0
 
-	sc.stateMachine = NewCtrlerStateMachine() // TODO
+	sc.stateMachine = NewCtrlerStateMachine()
 
 	sc.notifyChans = make(map[int]chan *OpReply)
 	sc.duplicateTable = make(map[int64]LastOperationInfo)

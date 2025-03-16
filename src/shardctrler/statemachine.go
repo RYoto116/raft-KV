@@ -134,7 +134,7 @@ func (csm *CtrlerStateMachine) Move(shard, gid int) Err {
 }
 
 func (csm *CtrlerStateMachine) Query(num int) (Config, Err) {
-	if num < 0 || num > len(csm.Configs) {
+	if num < 0 || num >= len(csm.Configs) {
 		return csm.Configs[len(csm.Configs)-1], OK
 	}
 	return csm.Configs[num], OK

@@ -233,7 +233,7 @@ func (kv *KVServer) applyTask() {
 				}
 
 				// 判断当前server是否需要snapshot（server本地日志大小是否超过阈值）
-				if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+				if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() >= kv.maxraftstate {
 					kv.makeSnapshot(message.CommandIndex)
 				}
 

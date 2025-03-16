@@ -26,22 +26,7 @@ func (kv *ShardKV) applyTask() {
 
 				if cmd.CmdType == ClientOperation {
 					op := cmd.Data.(Op)
-
-					// message可能是乱序的。为了保持线性一致性需要在日志应用时判断同一客户端的操作是顺序的
-					if op.OpType != OpGet && kv.isRequestDuplicate(op.ClientId, op.SeqId) {
-						opReply = kv.duplicateTable[op.ClientId].Reply
-					} else {
-						// 将操作应用到状态机中
-						opReply = kv.applyToStateMachine(op)
-
-						// 更新duplicateTable
-						if op.OpType != OpGet {
-							kv.duplicateTable[op.ClientId] = LastOperationInfo{
-								SeqId: op.SeqId,
-								Reply: opReply,
-							}
-						}
-					}
+					opReply = kv.applyClientOperation(op)
 				} else {
 					opReply = kv.handleConfigChange(cmd)
 				}
@@ -54,7 +39,7 @@ func (kv *ShardKV) applyTask() {
 				}
 
 				// 判断当前server是否需要snapshot（server本地日志大小是否超过阈值）
-				if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+				if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() >= kv.maxraftstate {
 					kv.makeSnapshot(message.CommandIndex)
 				}
 
@@ -74,17 +59,38 @@ func (kv *ShardKV) applyTask() {
 // fetchConfigTask 定期从 shardctrler 拉取配置，拿到配置后构造一个配置变更的命令，传入到 raft 模块中进行状态同步。
 func (kv *ShardKV) fetchConfigTask() {
 	for !kv.killed() {
-		kv.mu.Lock()
-		// 每次只能够拉取一个配置，并且按照顺序处理
-		// 主要是为了避免覆盖还未完成的配置变更任务
-		newConfig := kv.mck.Query(kv.currentConfig.Num + 1)
-		kv.mu.Unlock()
 
-		// 将新配置传入shardCtrler的raft模块进行同步
-		kv.ConfigCommand(RaftCommand{
-			CmdType: ConfigChange,
-			Data:    newConfig,
-		}, &OpReply{})
+		// BUG: 没有判断是否Leader
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			// 重要！！判断，如果任何一个 shard 的状态是非 Normal 的，则说明前一个 shard 迁移的流程还在进行中，需要跳过拉取新的配置，避免覆盖之前的任务
+			needFetch := true
+
+			kv.mu.Lock()
+
+			for _, shard := range kv.shards {
+				if shard.Status != Normal {
+					needFetch = false
+					break
+				}
+			}
+
+			// 巧妙！！在当前临界区获取临界区以外所需要的变量currentNum
+			currentNum := kv.currentConfig.Num
+			kv.mu.Unlock()
+
+			if needFetch {
+				// 每次只能够拉取一个配置，并且按照顺序处理
+				// 主要是为了避免覆盖还未完成的配置变更任务
+				newConfig := kv.mck.Query(currentNum + 1) // BUG: 在临界区外调访问 kv.currentConfig.Num
+				if newConfig.Num == currentNum+1 {
+					// 将新配置传入shardCtrler的raft模块进行同步
+					kv.ConfigCommand(RaftCommand{
+						CmdType: ConfigChange,
+						Data:    newConfig,
+					}, &OpReply{})
+				}
+			}
+		}
 
 		time.Sleep(FetchConfigInterval)
 	}
@@ -102,7 +108,7 @@ func (kv *ShardKV) shardMigrationTask() {
 			// 通过RPC向上述group请求shard状态机数据
 			var wg sync.WaitGroup
 			for gid, shards := range gidToShards {
-				wg.Add(1) // 为什么？
+				wg.Add(1)
 				// 参数：上一个配置的servers，当前配置编号，需要迁移的shard IDs
 				go func(servers []string, configNum int, shardIDs []int) {
 					defer wg.Done()
@@ -146,7 +152,7 @@ func (kv *ShardKV) shardGCTask() {
 
 			var wg sync.WaitGroup
 			for gid, shards := range gidToShards {
-				wg.Add(1) // 为什么？
+				wg.Add(1)
 
 				go func(servers []string, configNum int, shardIDs []int) {
 					defer wg.Done()
@@ -171,7 +177,7 @@ func (kv *ShardKV) shardGCTask() {
 						}
 					}
 
-				}(kv.currentConfig.Groups[gid], kv.currentConfig.Num, shards)
+				}(kv.prevConfig.Groups[gid], kv.currentConfig.Num, shards)
 			}
 
 			kv.mu.Unlock()
@@ -239,13 +245,14 @@ func (kv *ShardKV) DeleteShardsData(args *ShardOperationArgs, reply *ShardOperat
 	}
 
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
 
 	// 如果server当前状态比args中的状态更新，则不需要删除shard
 	if kv.currentConfig.Num > args.ConfigNum {
 		reply.Err = OK
+		kv.mu.Unlock() // BUG: 不能使用defer
 		return
 	}
+	kv.mu.Unlock() // BUG: 不能使用defer
 
 	// Leader 同步日志，进行状态机删除
 	var opReply OpReply
@@ -255,5 +262,29 @@ func (kv *ShardKV) DeleteShardsData(args *ShardOperationArgs, reply *ShardOperat
 	}, &opReply)
 
 	reply.Err = opReply.Err
+}
 
+func (kv *ShardKV) applyClientOperation(op Op) *OpReply {
+	// 集群的配置一直变化，需要判断用户请求是否由当前server所属group负责
+	if kv.matchGroup(op.Key) {
+		var opReply *OpReply
+		// message可能是乱序的。为了保持线性一致性需要在日志应用时判断同一客户端的操作是顺序的
+		if op.OpType != OpGet && kv.isRequestDuplicate(op.ClientId, op.SeqId) {
+			opReply = kv.duplicateTable[op.ClientId].Reply
+		} else {
+			// 将操作应用到状态机中
+			opReply = kv.applyToStateMachine(op)
+
+			// 更新duplicateTable
+			if op.OpType != OpGet {
+				kv.duplicateTable[op.ClientId] = LastOperationInfo{
+					SeqId: op.SeqId,
+					Reply: opReply,
+				}
+			}
+		}
+		return opReply
+	}
+
+	return &OpReply{Err: ErrWrongGroup}
 }

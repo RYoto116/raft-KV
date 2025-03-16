@@ -95,10 +95,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 		return
 	}
-	kv.mu.Unlock()
 
-	// 判断请求是否重复
-	kv.mu.Lock()
 	if kv.isRequestDuplicate(args.ClientId, args.SeqId) {
 		opReply := kv.duplicateTable[args.ClientId].Reply
 		reply.Err = opReply.Err
@@ -188,6 +185,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(RaftCommand{})
+	labgob.Register(ShardOperationArgs{})
+	labgob.Register(ShardOperationReply{})
+	labgob.Register(shardctrler.Config{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -195,6 +196,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.make_end = make_end
 	kv.gid = gid
 	kv.ctrlers = ctrlers
+
+	// Use something like this to talk to the shardctrler:
+	// 初始化shardCtrler客户端，以获取最新配置
+	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+
+	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// Your initialization code here.
 	kv.dead = 0
@@ -208,13 +216,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.prevConfig = shardctrler.DefaultConfig()
 	// 需要后台线程不断从shardCtrler获取集群的最新配置
 	kv.currentConfig = shardctrler.DefaultConfig()
-
-	// Use something like this to talk to the shardctrler:
-	// 初始化shardCtrler客户端，以获取最新配置
-	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
-
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.restoreFromSnapshot(persister.ReadSnapshot())
 
@@ -263,12 +264,20 @@ func (kv *ShardKV) makeSnapshot(index int) {
 	e := labgob.NewEncoder(buf)
 	e.Encode(kv.shards)
 	e.Encode(kv.duplicateTable)
+	e.Encode(kv.prevConfig)
+	e.Encode(kv.currentConfig)
 
 	kv.rf.Snapshot(index, buf.Bytes())
 }
 
 func (kv *ShardKV) restoreFromSnapshot(snaphot []byte) {
 	if len(snaphot) == 0 {
+		// 重要！！没有Snapshot时，需要初始化shard信息
+		for i := 0; i < shardctrler.NShards; i++ {
+			if _, ok := kv.shards[i]; !ok {
+				kv.shards[i] = NewMemoryKVMachine()
+			}
+		}
 		return
 	}
 
@@ -276,15 +285,21 @@ func (kv *ShardKV) restoreFromSnapshot(snaphot []byte) {
 	d := labgob.NewDecoder(buf)
 	var shards map[int]*MemoryKVStateMachine
 	var duplicateTable map[int64]LastOperationInfo
+	var prevConfig shardctrler.Config
+	var currentConfig shardctrler.Config
 
-	if d.Decode(&shards) != nil || d.Decode(&duplicateTable) != nil {
+	if d.Decode(&shards) != nil || d.Decode(&duplicateTable) != nil || d.Decode(&prevConfig) != nil || d.Decode(&currentConfig) != nil {
 		panic("failed to restore from snashot")
 	}
 	kv.shards = shards
 	kv.duplicateTable = duplicateTable
+	kv.prevConfig = prevConfig
+	kv.currentConfig = currentConfig
 }
 
+// 判断key是否属于当前server所属group负责的shard
+// 根据shard状态判断能否提供服务。如果是 GC 或者 Normal 状态，均可以继续提供服务
 func (kv *ShardKV) matchGroup(key string) bool {
 	shard := key2shard(key)
-	return kv.gid == kv.currentConfig.Shards[shard]
+	return kv.gid == kv.currentConfig.Shards[shard] && (kv.shards[shard].Status == Normal || kv.shards[shard].Status == GC)
 }

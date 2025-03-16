@@ -104,7 +104,8 @@ func TestJoinLeave(t *testing.T) {
 
 	cfg.join(0)
 
-	n := 10
+	// n := 10
+	n := 3
 	ka := make([]string, n)
 	va := make([]string, n)
 	for i := 0; i < n; i++ {

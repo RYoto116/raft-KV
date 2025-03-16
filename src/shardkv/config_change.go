@@ -55,17 +55,19 @@ func (kv *ShardKV) applyNewConfig(newConfig shardctrler.Config) *OpReply {
 	// 重要！！
 	if newConfig.Num == kv.currentConfig.Num+1 {
 		for i := 0; i < shardctrler.NShards; i++ {
+			if kv.currentConfig.Shards[i] != kv.gid && newConfig.Shards[i] == kv.gid {
+				// 需要将shard加入当前group的情况
+				gid := kv.currentConfig.Shards[i]
+				if gid != 0 {
+					kv.shards[i].Status = MoveIn
+				}
+			}
+
 			if kv.currentConfig.Shards[i] == kv.gid && newConfig.Shards[i] != kv.gid {
 				// 需要将shard迁移出当前group的情况
 				gid := newConfig.Shards[i]
 				if gid != 0 {
 					kv.shards[i].Status = MoveOut
-				}
-			} else if kv.currentConfig.Shards[i] != kv.gid && newConfig.Shards[i] == kv.gid {
-				// 需要将shard加入当前group的情况
-				gid := kv.currentConfig.Shards[i]
-				if gid != 0 {
-					kv.shards[i].Status = MoveIn
 				}
 			}
 		}

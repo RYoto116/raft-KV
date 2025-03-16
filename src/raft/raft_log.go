@@ -72,7 +72,7 @@ func (rl *RaftLog) size() int {
 // 还原tailLog的真实下标（即snapshot截断后下标）
 func (rl *RaftLog) idx(logicIdx int) int {
 	if logicIdx < rl.snapLastIdx || logicIdx >= rl.size() {
-		panic(fmt.Sprintf("%d is out of [%d, %d]", logicIdx, rl.snapLastIdx+1, rl.size()-1))
+		panic(fmt.Sprintf("%d is out of [%d, %d]", logicIdx, rl.snapLastIdx, rl.size()-1))
 	}
 	return logicIdx - rl.snapLastIdx
 }
